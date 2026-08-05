@@ -16,9 +16,12 @@ sk = SigningKey.generate(curve=NIST256p)
 vk = sk.verifying_key
 PUBLIC_KEY_HEX = vk.to_string().hex()
 
+def generate_admin_token():
+    return jwt.encode({"sub": "admin", "role": "admin"}, JWT_PRIVATE_KEY_PEM, algorithm="ES256")
+
 @pytest.fixture(autouse=True)
 def reset_db():
-    client.post("/reset-db")
+    client.post("/reset-db", headers={"Authorization": f"Bearer {generate_admin_token()}"})
 
 def create_valid_payload(parent_id="clean-parent-1"):
     # Create valid JWT
@@ -71,7 +74,7 @@ def test_integration_submit_valid_payload():
     assert response.status_code == 200
     assert response.json()["status"] == "success"
     
-    db_state = client.get("/db-state").json()
+    db_state = client.get("/db-state", headers={"Authorization": f"Bearer {generate_admin_token()}"}).json()
     assert payload["payload_id"] in db_state["dag"]
 
 def test_integration_submit_invalid_signature():
