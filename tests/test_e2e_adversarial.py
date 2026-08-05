@@ -14,9 +14,21 @@ client = TestClient(app)
 sk = SigningKey.generate(curve=NIST256p)
 PUBLIC_KEY_HEX = sk.verifying_key.to_string().hex()
 
+def generate_admin_token():
+    return jwt.encode(
+        {"sub": "admin-user", "role": "admin"},
+        JWT_PRIVATE_KEY_PEM, algorithm="ES256"
+    )
+
+def generate_designator_token():
+    return jwt.encode(
+        {"sub": "amg-webhook", "role": "designator"},
+        JWT_PRIVATE_KEY_PEM, algorithm="ES256"
+    )
+
 @pytest.fixture(autouse=True)
 def reset_db():
-    client.post("/reset-db")
+    client.post("/reset-db", headers={"Authorization": f"Bearer {generate_admin_token()}"})
 
 def create_payload(payload_id, parent_id, state_content):
     session_token = jwt.encode(
@@ -57,7 +69,7 @@ def create_payload(payload_id, parent_id, state_content):
         "agent_signature": signature_hex
     }
 
-def test_e2e_adversarial_injection():
+def test_e2e_adversarial_injection_via_designate():
     # 1. Establish normal DAG state
     payload_1 = create_payload("order-1", "clean-parent-1", {"item": "laptop"})
     assert client.post("/submit-candidate", json=payload_1).status_code == 200
@@ -65,21 +77,28 @@ def test_e2e_adversarial_injection():
     payload_2 = create_payload("order-2", "order-1", {"item": "mouse"})
     assert client.post("/submit-candidate", json=payload_2).status_code == 200
 
-    # 2. Assume node "order-1" is discovered to be tainted by an out-of-band intrusion detection
-    # We patch the DB to quarantine order-1 and its descendants (simulate the detection)
-    from src.governor_service import backend
-    import asyncio
-    async def simulate_detection():
-        c_p = await backend.compute_blast_radius("order-1")
-        for node in c_p:
-            await backend.add_to_quarantine_ledger(node)
-    asyncio.run(simulate_detection())
+    # 2. Assume node "order-1" is discovered to be tainted by an out-of-band intrusion detection (e.g. AMG)
+    # We use the authenticated /designate endpoint to trigger the BFS traversal
+    designate_event = {
+        "poisoned_node_id": "order-1",
+        "detected_at_utc": "2026-10-27T10:15:00Z",
+        "source": "amg_tamper_check",
+        "confidence_score": 0.99,
+        "reason": "Tamper detected by AMG webhook"
+    }
+    resp = client.post("/designate", json=designate_event, headers={"Authorization": f"Bearer {generate_designator_token()}"})
+    assert resp.status_code == 200
+    
+    # Verify the event contains the expected blast radius (order-1 and its descendant order-2)
+    event_data = resp.json()["event"]
+    assert "order-1" in event_data["computed_blast_radius_C_p"]
+    assert "order-2" in event_data["computed_blast_radius_C_p"]
 
     # 3. Agent blindly builds on order-2 (which descends from quarantined order-1)
     payload_3 = create_payload("order-3", "order-2", {"item": "keyboard"})
     response = client.post("/submit-candidate", json=payload_3)
     
-    # 4. Gateway must intercept via Transitive Taint Propagation
+    # 4. Gateway must intercept via Transitive Taint Propagation (admission-time block)
     assert response.status_code == 403
     event = response.json()["detail"]["event"]
     assert event["poisoned_root_id"] == "order-2"

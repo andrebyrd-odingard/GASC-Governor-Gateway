@@ -28,9 +28,11 @@ This gateway sits between your AI Agent orchestration frameworks and your shared
 *   **Historical Monotonicity**: Quarantine ledgers are append-only. Taint facts are never erased, ensuring true auditability.
 *   **Fail-Closed Irreducibility**: Instead of fabricating a recovery that breaks safety invariants, the system escalates irreducible faults for human review.
 
-### ⚠️ Threat Model Boundary: Provenance vs. Content
-GASC-ED v1.1 is designed exclusively for **Provenance Security** (tracking lineage, taint propagation, and topological isolation). It explicitly treats the `state_content` payload as an opaque blob. 
-**It does NOT scan content for Prompt Injections, XSS, or PII.** Content-level security is a separate, orthogonal concern that should be implemented via pluggable scanners (e.g., SAST or LLM firewalls) downstream by consumers of the state graph or within an Independent Verifier Engine.
+## Threat Model Boundary (What This Does NOT Do)
+
+This architecture provides **provenance security and containment**, not content scanning.
+- We do **not** inspect `state_content` for prompt injections, malware, or policy violations. The state is treated as an opaque, cryptographically sealed envelope. We assume an external detection pipeline (e.g., OWASP Agent Memory Guard or human review) will independently discover poison and issue a designation event.
+- **External Side-Effects (Semantic Rollback Hazard):** GASC-ED governs internal agent state and memory isolation. It does **not** provide idempotency guarantees for external side-effects (e.g., financial transactions, API mutations). A malicious agent could exploit the reconstruct-forward capability to double-execute actions (semantic rollback attacks like ACRFence). Applications must enforce their own external effect ledgers and idempotency keys to safely consume reintegrated agent identities.
 
 ## 🚀 Getting Started
 
