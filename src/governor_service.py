@@ -454,11 +454,22 @@ async def designate_poison(event: DesignationEvent, request: Request):
                 
             try:
                 # POST to adapter
+                compaction_covers = dag[comp_node].get("covers", [])
+                
+                # Structural projection: strip state_content
+                dag_projection = {}
+                for n_id, n_data in dag.items():
+                    dag_projection[n_id] = {k: v for k, v in n_data.items() if k != "state_content"}
+
                 async with httpx.AsyncClient() as client:
                     resp = await client.post(
                         f"{settings.RECOVERY_ADAPTER_URL}/reconstruct",
                         json={
-                            "frontier": rc_data["frontier"],
+                            "graph_snapshot": dag_projection,
+                            "quarantine_ledger": q_ledger,
+                            "poisoned_root_id": event.poisoned_node_id,
+                            "compaction_covers": compaction_covers,
+                            "requested_frontier": rc_data["frontier"],
                             "method": rc_data["method"],
                             "checkpoint": rc_data["checkpoint"]
                         },
@@ -487,7 +498,7 @@ async def designate_poison(event: DesignationEvent, request: Request):
                     
                 # R4 Identity Verification: Signature must match RECOVERY_ADAPTER_PUBLIC_KEY
                 adapter_key = settings.RECOVERY_ADAPTER_PUBLIC_KEY
-                if adapter_key and candidate.get("ephemeral_nhi", {}).get("identity_id") != adapter_key:
+                if not adapter_key or candidate.get("ephemeral_nhi", {}).get("identity_id") != adapter_key:
                     rc_data["disposition"] = "IRREDUCIBLE"
                     rc_data["reason"] = "invalid_identity"
                     continue
@@ -533,3 +544,42 @@ async def reset_db(request: Request):
         raise HTTPException(status_code=403, detail="Debug endpoints disabled in production")
     await backend.reset()
     return {"status": "ok"}
+
+@app.get("/reducibility-report")
+async def get_reducibility_report(request: Request):
+    verify_role_jwt(request, "admin")
+    repair_candidates = await backend.get_repair_candidates()
+    
+    total = len(repair_candidates)
+    reducible_count = 0
+    irreducible_count = 0
+    undecided_count = 0
+    reasons = {}
+    
+    for rc in repair_candidates.values():
+        disp = rc.get("disposition")
+        if disp == "REDUCIBLE":
+            reducible_count += 1
+        elif disp == "IRREDUCIBLE":
+            irreducible_count += 1
+            reason = rc.get("reason", "unknown")
+            reasons[reason] = reasons.get(reason, 0) + 1
+        else:
+            undecided_count += 1
+            
+    return {
+        "compactions_entering_repair_path": total,
+        "reducible": {
+            "count": reducible_count,
+            "fraction": reducible_count / total if total > 0 else 0.0
+        },
+        "irreducible": {
+            "count": irreducible_count,
+            "fraction": irreducible_count / total if total > 0 else 0.0,
+            "reasons": reasons
+        },
+        "undecided": {
+            "count": undecided_count,
+            "fraction": undecided_count / total if total > 0 else 0.0
+        }
+    }
