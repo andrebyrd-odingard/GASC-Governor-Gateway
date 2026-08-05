@@ -86,6 +86,8 @@ bin/opa test policies/ -v
 *   `src/`: Contains the core `governor_service.py` (FastAPI) and the Python-based `gasc_audit_engine.py`.
 *   `tests/`: Contains the pytest suites that validate schema compliance, integration pathways, and E2E fault injection limits.
 
-## ⚖️ License
+## ⚖️ License & Trademarks
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)** - see the [LICENSE](LICENSE) file for details. This ensures that the Gateway remains open source and freely available, while preventing proprietary commercialization of network-hosted versions without contributing back.
+
+**Trademark Notice**: "Odingard Security", "GASC-ED", and "Containment Survivability Research" are trademarks of Six Sense Enterprise Services LLC. Please see [TRADEMARK.md](TRADEMARK.md) for usage guidelines.
