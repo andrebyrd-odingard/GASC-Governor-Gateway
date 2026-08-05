@@ -37,3 +37,9 @@ jobs:
     - name: Run OPA Policy Tests
       run: |
         bin/opa test policies/ -v
+
+    - name: Run SQLite Benchmarks
+      run: |
+        export ARTIFACT_DIR=$(pwd)/
+        python benchmarks/reproduce_0001b.py
+        cat 0001b_reproduction.md

@@ -10,3 +10,5 @@ cryptography==50.0.0
 pydantic-settings==2.14.2
 respx
 litellm>=1.0.0
+aiosqlite>=0.20.0
+-e ../gasc-audit
