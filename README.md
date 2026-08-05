@@ -1,8 +1,10 @@
 # GASC-Governor-Gateway
 
+[![CI Status](https://github.com/andrebyrd-odingard/GASC-Governor-Gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/andrebyrd-odingard/GASC-Governor-Gateway/actions/workflows/ci.yml)
+
 The **GASC-Governor-Gateway** is a lightweight, fail-closed policy enforcement sidecar that isolates AI agents and prevents cascading failures via Transitive Taint Propagation.
 
-It implements the [GASC-ED v1.1 Engineering Architecture & Policy-as-Code Specification](https://example.com/placeholder-gasc-ed-spec) and enforces rules based on the **Containment Survivability Research (CSR) Program**.
+It implements the [GASC-ED v1.1 Engineering Architecture & Policy-as-Code Specification](https://ssrn.com/abstract=6976282) and enforces rules based on the **Containment Survivability Research (CSR) Program** (specifically CSR-PUB-0005).
 
 ## 🔬 About the CSR Program
 
@@ -60,6 +62,13 @@ This gateway sits between your AI Agent orchestration frameworks and your shared
 ## 🧪 Testing and Validation
 
 This repository includes a comprehensive, multi-layered test suite that verifies the core tenets of the GASC-ED v1.1 specification, including unit tests for JSON schemas and OPA policies, integration tests for the FastAPI gateway, and an End-to-End Adversarial Fault Injection scenario.
+
+### ⚠️ Compliance & Non-Claims Disclaimer
+
+As explicitly stated in CSR-PUB-0005:
+
+*   **Conformance, Not Survivability:** This repository provides auditable controls, logs, and fail-closed gates that pass the GASC-ED v1.1 **conformance suite**. It does *not* claim empirical "containment survivability" out-of-the-box, which requires preregistered joint criteria over a specific operating envelope.
+*   **Rule 2 (Second Source) & Rule 1 (Non-Vacuity):** To prevent self-attestation, any production audit must run against external graph snapshots and seeded incidents so the automated audit runner does not score rows as `NOT-EXERCISED` or `SELF-ATTESTED`.
 
 ### Run the Python Test Suite
 
