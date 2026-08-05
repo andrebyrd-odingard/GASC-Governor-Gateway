@@ -64,7 +64,7 @@ def test_integration_submit_tainted_parent():
 def test_integration_submit_verification_failure():
     # Payload valid structurally, but has forbidden "justification" output
     payload = create_valid_payload()
-    payload["justification"] = "Because I said so"
+    payload["state_content"]["justification"] = "Because I said so"
     
     response = client.post("/submit-candidate", json=payload)
     
