@@ -1,6 +1,6 @@
 package gasc.governor.verification
 
-import future.keywords.in
+import future.keywords
 
 default allow_reintegration = false
 default is_irreducible = false

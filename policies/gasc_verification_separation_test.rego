@@ -1,4 +1,5 @@
 package gasc.governor.verification
+import future.keywords
 
 # Test Case 1: A valid reintegration request should be allowed.
 test_allow_reintegration_success if {

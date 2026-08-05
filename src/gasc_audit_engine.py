@@ -146,6 +146,7 @@ class GASCAuditEngine:
 
 if __name__ == "__main__":
     # Example execution schema
+    import tempfile
     dummy_manifest = {
         "boundary_id": "BOUNDARY-PROD-2026-A",
         "operating_envelope_declaration": "Production Multi-Agent Supply Chain Engine (Max 50 Nodes)",
@@ -165,8 +166,9 @@ if __name__ == "__main__":
         }
     }
     
-    with open("audit_manifest.json", "w") as f:
-        json.dump(dummy_manifest, f)
-        
-    engine = GASCAuditEngine("audit_manifest.json")
+    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".json") as tmp:
+        json.dump(dummy_manifest, tmp)
+        manifest_path = tmp.name
+
+    engine = GASCAuditEngine(manifest_path)
     print(json.dumps(engine.run_full_audit(), indent=2))

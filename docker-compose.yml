@@ -5,9 +5,11 @@ services:
     build: .
     ports:
       - "8000:8000"
+    # For a secure deployment, the JWT_PUBLIC_KEY must be provided.
+    # You can create a .env file in the root directory with:
+    # JWT_PUBLIC_KEY="-----BEGIN PUBLIC KEY-----\n..."
     environment:
       - OPA_URL=http://opa:8181
-      - JWT_SECRET=production_secret_key_here
     depends_on:
       - opa
 

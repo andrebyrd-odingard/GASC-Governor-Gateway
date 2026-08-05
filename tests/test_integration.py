@@ -1,16 +1,17 @@
 import pytest
-from fastapi.testclient import TestClient
-from src.governor_service import app, settings
-import uuid
 import json
 import hashlib
 import jwt
 from datetime import datetime, timezone
 from ecdsa import SigningKey, NIST256p
+from fastapi.testclient import TestClient
+
+from tests.conftest import JWT_PRIVATE_KEY_PEM
+from src.governor_service import app, settings
 
 client = TestClient(app)
 
-# Generate a consistent keypair for tests
+# 2. Generate Identity Keypair (ECDSA)
 sk = SigningKey.generate(curve=NIST256p)
 vk = sk.verifying_key
 PUBLIC_KEY_HEX = vk.to_string().hex()
@@ -26,10 +27,11 @@ def create_valid_payload(parent_id="clean-parent-1"):
             "sub": PUBLIC_KEY_HEX, 
             "scope": "agent:state:reconstruct",
             "is_nhi": True,
-            "expires_at_epoch": int(datetime.now(timezone.utc).timestamp()) + 3600
+            "expires_at_epoch": int(datetime.now(timezone.utc).timestamp()) + 3600,
+            "verifier_execution_status": "PASSED"
         },
-        settings.JWT_SECRET,
-        algorithm="HS256"
+        JWT_PRIVATE_KEY_PEM,
+        algorithm="ES256"
     )
 
     state_content = {"action": "create_order"}
@@ -41,7 +43,7 @@ def create_valid_payload(parent_id="clean-parent-1"):
     signature_hex = signature_bytes.hex()
 
     return {
-        "payload_id": str(uuid.uuid4()),
+        "payload_id": "payload-" + hashlib.md5(str(datetime.now()).encode()).hexdigest(),
         "timestamp_utc": "2026-10-27T10:00:00Z",
         "ephemeral_nhi": {
             "identity_id": PUBLIC_KEY_HEX,
@@ -86,6 +88,16 @@ def test_integration_submit_invalid_jwt():
     assert response.status_code == 401
     assert "Invalid Session Token" in response.json()["detail"]
 
+def test_integration_submit_jwt_identity_mismatch():
+    payload = create_valid_payload()
+    # Provide a different pubkey in the payload to spoof identity
+    sk2 = SigningKey.generate(curve=NIST256p)
+    payload["ephemeral_nhi"]["identity_id"] = sk2.verifying_key.to_string().hex()
+    
+    response = client.post("/submit-candidate", json=payload)
+    assert response.status_code == 401
+    assert "JWT subject does not match payload identity" in response.json()["detail"]
+
 def test_integration_submit_lineage_failure():
     payload = create_valid_payload(parent_id="non-existent-parent")
     response = client.post("/submit-candidate", json=payload)
@@ -101,7 +113,6 @@ def test_integration_submit_tainted_parent():
     error_detail = response.json()["detail"]
     assert error_detail["error"] == "TAINTED_PARENT"
     assert error_detail["event"]["poisoned_root_id"] == "quarantined-node-A"
-    # Ensure blast radius is dynamically calculated (including the attempted node)
     assert payload["payload_id"] in error_detail["event"]["computed_blast_radius_C_p"]
     assert "quarantined-node-A" in error_detail["event"]["computed_blast_radius_C_p"]
 

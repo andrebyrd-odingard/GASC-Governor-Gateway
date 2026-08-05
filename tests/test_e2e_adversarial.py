@@ -5,6 +5,8 @@ import jwt
 from datetime import datetime, timezone
 from fastapi.testclient import TestClient
 from ecdsa import SigningKey, NIST256p
+
+from tests.conftest import JWT_PRIVATE_KEY_PEM
 from src.governor_service import app, settings
 
 client = TestClient(app)
@@ -22,10 +24,11 @@ def create_payload(payload_id, parent_id, state_content):
             "sub": PUBLIC_KEY_HEX, 
             "scope": "agent:state:reconstruct",
             "is_nhi": True,
-            "expires_at_epoch": int(datetime.now(timezone.utc).timestamp()) + 3600
+            "expires_at_epoch": int(datetime.now(timezone.utc).timestamp()) + 3600,
+            "verifier_execution_status": "PASSED"
         },
-        settings.JWT_SECRET,
-        algorithm="HS256"
+        JWT_PRIVATE_KEY_PEM,
+        algorithm="ES256"
     )
 
     content_str = json.dumps(state_content, sort_keys=True)
