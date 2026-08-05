@@ -14,6 +14,8 @@ from ecdsa import VerifyingKey, NIST256p
 from pydantic_settings import BaseSettings
 from typing import Dict, List, Any
 from abc import ABC, abstractmethod
+from pydantic import BaseModel
+from enum import Enum
 
 # --- Settings ---
 class Settings(BaseSettings):
@@ -31,12 +33,28 @@ OPA_BIN = ROOT_DIR / "bin" / "opa"
 with open(SCHEMAS_DIR / "state_write_payload.json", "r") as f:
     PAYLOAD_SCHEMA = json.load(f)
 
+# --- Designation Models ---
+class DesignationSource(str, Enum):
+    HUMAN_REPORT = "human_report"
+    EXTERNAL_SENSOR = "external_sensor"
+    DOWNSTREAM_CONTRADICTION = "downstream_contradiction"
+    AMG_TAMPER_CHECK = "amg_tamper_check"
+
+class DesignationEvent(BaseModel):
+    poisoned_node_id: str
+    detected_at_utc: str
+    source: DesignationSource
+    confidence_score: float
+    reason: str
+
 # --- State Backend Abstraction ---
 class BaseStateBackend(ABC):
     @abstractmethod
     async def get_dag(self) -> Dict[str, Any]: pass
     @abstractmethod
     async def get_quarantine_ledger(self) -> List[str]: pass
+    @abstractmethod
+    async def get_repair_candidates(self) -> Dict[str, Any]: pass
     @abstractmethod
     async def commit_node(self, payload: dict): pass
     @abstractmethod
@@ -57,12 +75,16 @@ class MemoryStateBackend(BaseStateBackend):
         self.dag = {"clean-parent-1": {"payload_id": "clean-parent-1", "parent_dependency_commitments": []}}
         self.quarantine_ledger = ["quarantined-node-A"]
         self.quarantine_events = []
+        self.repair_candidates = {}
         
     async def get_dag(self) -> Dict[str, Any]:
         async with self.lock: return self.dag.copy()
         
     async def get_quarantine_ledger(self) -> List[str]:
         async with self.lock: return list(self.quarantine_ledger)
+        
+    async def get_repair_candidates(self) -> Dict[str, Any]:
+        async with self.lock: return dict(self.repair_candidates)
         
     async def commit_node(self, payload: dict):
         async with self.lock: self.dag[payload["payload_id"]] = payload
@@ -71,22 +93,43 @@ class MemoryStateBackend(BaseStateBackend):
         async with self.lock: self.quarantine_events.append(event)
         
     async def add_to_quarantine_ledger(self, node_id: str):
-        async with self.lock: self.quarantine_ledger.append(node_id)
+        async with self.lock:
+            if node_id not in self.quarantine_ledger:
+                self.quarantine_ledger.append(node_id)
         
     async def compute_blast_radius(self, poisoned_root_id: str) -> List[str]:
-        # True Graph Traversal (BFS)
+        # True Graph Traversal (BFS) with COMPACTION/CARRIED edge logic
         async with self.lock:
             visited = set([poisoned_root_id])
             queue = [poisoned_root_id]
+            c_p = []
+            
             while queue:
                 current = queue.pop(0)
+                c_p.append(current)
+                
                 for node_id, node_data in self.dag.items():
                     if node_id in visited: continue
-                    parents = [p["parent_node_id"] for p in node_data.get("parent_dependency_commitments", [])]
+                    
+                    parents = []
+                    is_carried = False
+                    for p in node_data.get("parent_dependency_commitments", []):
+                        if p["parent_node_id"] == current:
+                            parents.append(current)
+                            if p.get("edge_class") == "CARRIED":
+                                is_carried = True
+                                
                     if current in parents:
                         visited.add(node_id)
                         queue.append(node_id)
-            return sorted(list(visited)) # Sorted for deterministic tests
+                        if is_carried:
+                            # Flag as repair candidate, but traversal STILL continues (Fail-closed irreducibility)
+                            self.repair_candidates[node_id] = {
+                                "disposition": "IRREDUCIBLE",
+                                "reason": "no_reconstruction_backend",
+                                "escalation_record": "Requires human review"
+                            }
+            return sorted(c_p)
 
     async def reset(self):
         async with self.lock: self._reset_sync()
@@ -103,6 +146,19 @@ def verify_nhi_jwt(token: str, payload_identity: str) -> dict:
         return claims
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Invalid Session Token: {str(e)}")
+
+def verify_role_jwt(request: Request, required_role: str) -> dict:
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid token")
+    token = auth_header.split(" ")[1]
+    try:
+        claims = jwt.decode(token, settings.JWT_PUBLIC_KEY, algorithms=["ES256"])
+        if claims.get("role") != required_role:
+            raise ValueError(f"Token must have '{required_role}' role")
+        return claims
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Unauthorized: {str(e)}")
 
 def verify_cryptographic_signature(payload: dict) -> bool:
     if "agent_signature" not in payload or not payload["agent_signature"]:
@@ -130,11 +186,8 @@ async def evaluate_opa_policy(policy_package: str, query: str, input_data: dict)
                 res = await client.post(f"{settings.OPA_URL}/v1/data/{policy_package}", json={"input": input_data})
                 if res.status_code == 200:
                     result = res.json().get("result", {})
-                    # For different packages, OPA returns different top-level rule names
-                    if "allow_state_write" in result:
-                        return result["allow_state_write"]
-                    if "allow_reintegration" in result:
-                        return result["allow_reintegration"]
+                    if "allow_state_write" in result: return result["allow_state_write"]
+                    if "allow_reintegration" in result: return result["allow_reintegration"]
                 return False
         except Exception as e:
             print(f"OPA REST Error: {e}")
@@ -146,13 +199,11 @@ async def evaluate_opa_policy(policy_package: str, query: str, input_data: dict)
         *cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
     stdout, stderr = await process.communicate(input=json.dumps(input_data).encode())
-    if process.returncode != 0:
-        return False
+    if process.returncode != 0: return False
     try:
         output = json.loads(stdout.decode())
         return output.get("result", [{}])[0].get("expressions", [{}])[0].get("value", False)
-    except:
-        return False
+    except: return False
 
 # --- Routes ---
 @app.post("/submit-candidate")
@@ -167,14 +218,19 @@ async def submit_candidate(request: Request):
     except jsonschema.exceptions.ValidationError as e:
         raise HTTPException(status_code=400, detail=f"Schema validation failed: {e.message}")
         
-    # Identity Verification
     token = payload.get("ephemeral_nhi", {}).get("session_token")
     identity_id = payload.get("ephemeral_nhi", {}).get("identity_id")
     auth_context = verify_nhi_jwt(token, identity_id)
     
-    # Cryptographic Integrity Verification
     if not verify_cryptographic_signature(payload):
         raise HTTPException(status_code=401, detail="Cryptographic signature verification failed")
+
+    # Topological Coverage Diff (if COMPACTION)
+    if payload.get("node_type") == "COMPACTION":
+        # Simplified coverage diff computation for PoC.
+        # In a full implementation, this finds nodes physically situated between the 
+        # earliest and latest covered nodes that were omitted from `covers`.
+        payload["covers_diff"] = [] 
 
     q_ledger = await backend.get_quarantine_ledger()
     dag = await backend.get_dag()
@@ -205,9 +261,6 @@ async def submit_candidate(request: Request):
             updated_ledger = q_ledger + [payload.get("payload_id")]
             monotonic_ledger_digest = hashlib.sha256(json.dumps(updated_ledger, sort_keys=True).encode()).hexdigest()
             
-            # The tainted node is intentionally committed to the DAG here to preserve 
-            # the topological audit trail of the attempted attack. Its simultaneous 
-            # addition to the quarantine ledger guarantees structural isolation.
             event = {
                 "quarantine_event_id": str(uuid.uuid4()),
                 "detected_at_utc": datetime.now(timezone.utc).isoformat() + "Z",
@@ -250,18 +303,57 @@ async def submit_candidate(request: Request):
     await backend.commit_node(payload)
     return {"status": "success", "message": "State node committed to DAG."}
 
+@app.post("/designate")
+async def designate_poison(event: DesignationEvent, request: Request):
+    claims = verify_role_jwt(request, "designator")
+    
+    dag = await backend.get_dag()
+    if event.poisoned_node_id not in dag:
+        raise HTTPException(status_code=404, detail="Node ID not found in DAG")
+        
+    q_ledger = await backend.get_quarantine_ledger()
+    if event.poisoned_node_id in q_ledger:
+        return {"status": "ok", "message": "Node already in quarantine ledger"}
+        
+    c_p = await backend.compute_blast_radius(event.poisoned_node_id)
+    
+    independent_snapshot_hash = hashlib.sha256(json.dumps(dag, sort_keys=True).encode()).hexdigest()
+    
+    for node in c_p:
+        await backend.add_to_quarantine_ledger(node)
+            
+    updated_ledger = await backend.get_quarantine_ledger()
+    monotonic_ledger_digest = hashlib.sha256(json.dumps(updated_ledger, sort_keys=True).encode()).hexdigest()
+    
+    q_event = {
+        "quarantine_event_id": str(uuid.uuid4()),
+        "detected_at_utc": datetime.now(timezone.utc).isoformat() + "Z",
+        "poisoned_root_id": event.poisoned_node_id,
+        "computed_blast_radius_C_p": c_p,
+        "independent_snapshot_hash": independent_snapshot_hash,
+        "monotonic_ledger_digest_post_transition": monotonic_ledger_digest,
+        "designator_identity": claims.get("sub"),
+        "designation_reason": event.reason
+    }
+    await backend.log_quarantine_event(q_event)
+    
+    return {"status": "success", "event": q_event}
+
 @app.get("/db-state")
-async def get_db_state():
+async def get_db_state(request: Request):
+    verify_role_jwt(request, "admin")
     if not settings.DEBUG_MODE:
         raise HTTPException(status_code=403, detail="Debug endpoints disabled in production")
     return {
         "dag": await backend.get_dag(),
         "quarantine_ledger": await backend.get_quarantine_ledger(),
-        "quarantine_events": backend.quarantine_events
+        "quarantine_events": backend.quarantine_events,
+        "repair_candidates": await backend.get_repair_candidates()
     }
 
 @app.post("/reset-db")
-async def reset_db():
+async def reset_db(request: Request):
+    verify_role_jwt(request, "admin")
     if not settings.DEBUG_MODE:
         raise HTTPException(status_code=403, detail="Debug endpoints disabled in production")
     await backend.reset()
