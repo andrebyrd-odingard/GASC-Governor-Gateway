@@ -1,4 +1,5 @@
 package gasc.governor.integrity
+import future.keywords
 
 test_allow_state_write_success if {
     allow_state_write with input as {

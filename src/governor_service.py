@@ -18,7 +18,8 @@ from abc import ABC, abstractmethod
 # --- Settings ---
 class Settings(BaseSettings):
     OPA_URL: str | None = None # e.g. http://localhost:8181
-    JWT_SECRET: str = "unsafe_default_secret_for_testing"
+    JWT_PUBLIC_KEY: str
+    DEBUG_MODE: bool = False
 
 settings = Settings()
 
@@ -94,9 +95,12 @@ backend = MemoryStateBackend()
 app = FastAPI()
 
 # --- Security Checks ---
-def verify_nhi_jwt(token: str) -> dict:
+def verify_nhi_jwt(token: str, payload_identity: str) -> dict:
     try:
-        return jwt.decode(token, settings.JWT_SECRET, algorithms=["HS256"])
+        claims = jwt.decode(token, settings.JWT_PUBLIC_KEY, algorithms=["ES256"])
+        if claims.get("sub") != payload_identity:
+            raise ValueError("JWT subject does not match payload identity")
+        return claims
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Invalid Session Token: {str(e)}")
 
@@ -165,7 +169,8 @@ async def submit_candidate(request: Request):
         
     # Identity Verification
     token = payload.get("ephemeral_nhi", {}).get("session_token")
-    auth_context = verify_nhi_jwt(token)
+    identity_id = payload.get("ephemeral_nhi", {}).get("identity_id")
+    auth_context = verify_nhi_jwt(token, identity_id)
     
     # Cryptographic Integrity Verification
     if not verify_cryptographic_signature(payload):
@@ -195,13 +200,21 @@ async def submit_candidate(request: Request):
             await backend.commit_node(payload) 
             c_p = await backend.compute_blast_radius(poisoned_root)
             
+            dag_state = await backend.get_dag()
+            independent_snapshot_hash = hashlib.sha256(json.dumps(dag_state, sort_keys=True).encode()).hexdigest()
+            updated_ledger = q_ledger + [payload.get("payload_id")]
+            monotonic_ledger_digest = hashlib.sha256(json.dumps(updated_ledger, sort_keys=True).encode()).hexdigest()
+            
+            # The tainted node is intentionally committed to the DAG here to preserve 
+            # the topological audit trail of the attempted attack. Its simultaneous 
+            # addition to the quarantine ledger guarantees structural isolation.
             event = {
                 "quarantine_event_id": str(uuid.uuid4()),
                 "detected_at_utc": datetime.now(timezone.utc).isoformat() + "Z",
                 "poisoned_root_id": poisoned_root,
                 "computed_blast_radius_C_p": c_p,
-                "independent_snapshot_hash": "a"*64,
-                "monotonic_ledger_digest_post_transition": "b"*64
+                "independent_snapshot_hash": independent_snapshot_hash,
+                "monotonic_ledger_digest_post_transition": monotonic_ledger_digest
             }
             await backend.log_quarantine_event(event)
             await backend.add_to_quarantine_ledger(payload.get("payload_id"))
@@ -219,7 +232,7 @@ async def submit_candidate(request: Request):
         "quarantine_set_Q": q_ledger,
         "auth_context": auth_context,
         "request_timestamp_epoch": int(datetime.now(timezone.utc).timestamp()),
-        "verifier_execution_status": "PASSED"
+        "verifier_execution_status": auth_context.get("verifier_execution_status", "PENDING")
     }
     
     if "justification" in payload.get("state_content", {}):
@@ -239,6 +252,8 @@ async def submit_candidate(request: Request):
 
 @app.get("/db-state")
 async def get_db_state():
+    if not settings.DEBUG_MODE:
+        raise HTTPException(status_code=403, detail="Debug endpoints disabled in production")
     return {
         "dag": await backend.get_dag(),
         "quarantine_ledger": await backend.get_quarantine_ledger(),
@@ -247,5 +262,7 @@ async def get_db_state():
 
 @app.post("/reset-db")
 async def reset_db():
+    if not settings.DEBUG_MODE:
+        raise HTTPException(status_code=403, detail="Debug endpoints disabled in production")
     await backend.reset()
     return {"status": "ok"}

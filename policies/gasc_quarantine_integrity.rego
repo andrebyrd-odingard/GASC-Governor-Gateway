@@ -1,6 +1,6 @@
 package gasc.governor.integrity
 
-import future.keywords.in
+import future.keywords
 
 default allow_state_write = false
 
