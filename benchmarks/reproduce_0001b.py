@@ -89,11 +89,11 @@ async def run_trial(trial_idx):
             
             # Edge Insert
             t_edge_start = time.perf_counter()
-            for p in parents:
-                await db.execute(
-                    "INSERT INTO edges (child_id, parent_id, edge_class) VALUES (?, ?, ?)",
-                    (node_id, p["parent_node_id"], p.get("edge_class", "MATERIAL"))
-                )
+            edge_rows = [(node_id, p["parent_node_id"], p.get("edge_class", "MATERIAL")) for p in parents]
+            await db.executemany(
+                "INSERT INTO edges (child_id, parent_id, edge_class) VALUES (?, ?, ?)",
+                edge_rows
+            )
             await db.commit()
             t_edge_end = time.perf_counter()
             
