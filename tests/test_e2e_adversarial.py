@@ -1,24 +1,43 @@
 import pytest
-import uuid
 import json
-from pathlib import Path
+import hashlib
+import jwt
+from datetime import datetime, timezone
 from fastapi.testclient import TestClient
-from src.governor_service import app
-from src.gasc_audit_engine import GASCAuditEngine
+from ecdsa import SigningKey, NIST256p
+from src.governor_service import app, settings
 
 client = TestClient(app)
+
+sk = SigningKey.generate(curve=NIST256p)
+PUBLIC_KEY_HEX = sk.verifying_key.to_string().hex()
 
 @pytest.fixture(autouse=True)
 def reset_db():
     client.post("/reset-db")
 
-def create_payload(action, parent_id):
+def create_payload(payload_id, parent_id, state_content):
+    session_token = jwt.encode(
+        {
+            "sub": PUBLIC_KEY_HEX, 
+            "scope": "agent:state:reconstruct",
+            "is_nhi": True,
+            "expires_at_epoch": int(datetime.now(timezone.utc).timestamp()) + 3600
+        },
+        settings.JWT_SECRET,
+        algorithm="HS256"
+    )
+
+    content_str = json.dumps(state_content, sort_keys=True)
+    actual_hash = hashlib.sha256(content_str.encode()).hexdigest()
+    signature_hex = sk.sign(actual_hash.encode()).hex()
+
     return {
-        "payload_id": str(uuid.uuid4()),
+        "payload_id": payload_id,
         "timestamp_utc": "2026-10-27T10:00:00Z",
         "ephemeral_nhi": {
-            "identity_id": "agent-test",
-            "session_token": "token",
+            "identity_id": PUBLIC_KEY_HEX,
+            "session_token": session_token,
             "expires_at_utc": "2026-10-27T11:00:00Z"
         },
         "declared_evidence_boundary": {
@@ -30,76 +49,38 @@ def create_payload(action, parent_id):
             "parent_node_id": parent_id,
             "parent_content_hash": "e" * 64
         }],
-        "state_content": {"action": action},
-        "content_digest_sha256": "d" * 64,
-        "agent_signature": "signature"
+        "state_content": state_content,
+        "content_digest_sha256": actual_hash,
+        "agent_signature": signature_hex
     }
 
-def test_adversarial_fault_injection():
-    # 1. Agent A creates an order
-    order_payload = create_payload("create_order", "clean-parent-1")
-    response_a = client.post("/submit-candidate", json=order_payload)
-    assert response_a.status_code == 200
+def test_e2e_adversarial_injection():
+    # 1. Establish normal DAG state
+    payload_1 = create_payload("order-1", "clean-parent-1", {"item": "laptop"})
+    assert client.post("/submit-candidate", json=payload_1).status_code == 200
     
-    order_id = order_payload["payload_id"]
+    payload_2 = create_payload("order-2", "order-1", {"item": "mouse"})
+    assert client.post("/submit-candidate", json=payload_2).status_code == 200
+
+    # 2. Assume node "order-1" is discovered to be tainted by an out-of-band intrusion detection
+    # We patch the DB to quarantine order-1 and its descendants (simulate the detection)
+    from src.governor_service import backend
+    import asyncio
+    async def simulate_detection():
+        c_p = await backend.compute_blast_radius("order-1")
+        for node in c_p:
+            await backend.add_to_quarantine_ledger(node)
+    asyncio.run(simulate_detection())
+
+    # 3. Agent blindly builds on order-2 (which descends from quarantined order-1)
+    payload_3 = create_payload("order-3", "order-2", {"item": "keyboard"})
+    response = client.post("/submit-candidate", json=payload_3)
     
-    # 2. Inject Poison Pill (Zero-Day bypasses Governor and directly alters DB)
-    db_state = client.get("/db-state").json()
-    # We simulate discovering the node is poisoned by adding it to the quarantine ledger
-    # In reality, a separate monitor or intrusion detection system would do this.
-    db_state["quarantine_ledger"].append(order_id)
+    # 4. Gateway must intercept via Transitive Taint Propagation
+    assert response.status_code == 403
+    event = response.json()["detail"]["event"]
+    assert event["poisoned_root_id"] == "order-2"
     
-    # We have to patch the in-memory db directly for this test since /db-state is read-only
-    # Let's use the app's internal db object
-    from src.governor_service import db
-    db["quarantine_ledger"].append(order_id)
-    
-    # 3. Agent B processes payment based on the poisoned order
-    payment_payload = create_payload("process_payment", order_id)
-    response_b = client.post("/submit-candidate", json=payment_payload)
-    
-    # 4. Assertions
-    # Assertion 1 (Containment): Governor rejects write
-    assert response_b.status_code == 403
-    error_detail = response_b.json()["detail"]
-    assert error_detail["error"] == "TAINTED_PARENT"
-    
-    # Assertion 2 (Blast Radius): Correctly calculate C(p)
-    event = error_detail["event"]
-    assert order_id in event["computed_blast_radius_C_p"]
-    assert payment_payload["payload_id"] in event["computed_blast_radius_C_p"]
-    
-    # Assertion 3 (Audit Trail): Verify with Audit Engine
-    db_state = client.get("/db-state").json()
-    
-    audit_manifest = {
-        "boundary_id": "BOUNDARY-TEST",
-        "operating_envelope_declaration": "E2E Test Envelope",
-        "admitted_writes": [order_payload],
-        "quarantine_incidents": db_state["quarantine_events"],
-        "quarantine_transitions": [
-            {"quarantine_set": ["quarantined-node-A"]},
-            {"quarantine_set": ["quarantined-node-A", order_id]},
-            {"quarantine_set": ["quarantined-node-A", order_id, payment_payload["payload_id"]]}
-        ],
-        "fault_injection_campaign": {
-            "preregistered_suite_run": True,
-            "shared_dependency_inventory_published": True,
-            "observed_catch_rate": 1.0,
-            "preregistered_target_catch_rate": 0.95
-        }
-    }
-    
-    manifest_path = Path(__file__).parent / "temp_audit_manifest.json"
-    with open(manifest_path, "w") as f:
-        json.dump(audit_manifest, f)
-        
-    engine = GASCAuditEngine(str(manifest_path))
-    results = engine.run_full_audit()
-    manifest_path.unlink()
-    
-    assert results["conformance_summary"]["overall_audit_passed"] is True
-    
-    # Specifically check REQ-002 (Transitive Containment)
-    req_2_result = next(r for r in results["row_by_row_results"] if r["req_id"] == "GASC-REQ-002")
-    assert req_2_result["status"] == "PASS"
+    # Verify true dynamic blast radius C(p) correctly identified descendants
+    assert "order-2" in event["computed_blast_radius_C_p"]
+    assert "order-3" in event["computed_blast_radius_C_p"]

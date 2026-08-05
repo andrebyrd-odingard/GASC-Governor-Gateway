@@ -22,12 +22,26 @@ This repository is the practical software implementation of those findings.
 
 This gateway sits between your AI Agent orchestration frameworks and your shared memory graph. It natively intercepts state writes and enforces:
 
-*   **Transitive Containment**: Automatically intercepts writes attempting to build on poisoned roots.
+*   **Transitive Containment**: Automatically intercepts writes attempting to build on poisoned roots via dynamic Graph Traversal blast-radius calculations.
 *   **Verification Separation (OPA)**: Uses embedded Open Policy Agent (Rego) policies to ensure agents cannot authorize their own reintegration using evaluative outputs (e.g., planner scores or justifications).
+*   **Cryptographic Binding**: Enforces ECDSA signature verification and JWT validation to guarantee identity and payload integrity.
 *   **Historical Monotonicity**: Quarantine ledgers are append-only. Taint facts are never erased, ensuring true auditability.
 *   **Fail-Closed Irreducibility**: Instead of fabricating a recovery that breaks safety invariants, the system escalates irreducible faults for human review.
 
+### ⚠️ Threat Model Boundary: Provenance vs. Content
+GASC-ED v1.1 is designed exclusively for **Provenance Security** (tracking lineage, taint propagation, and topological isolation). It explicitly treats the `state_content` payload as an opaque blob. 
+**It does NOT scan content for Prompt Injections, XSS, or PII.** Content-level security is a separate, orthogonal concern that should be implemented via pluggable scanners (e.g., SAST or LLM firewalls) downstream by consumers of the state graph or within an Independent Verifier Engine.
+
 ## 🚀 Getting Started
+
+### Option 1: Production Deployment (Docker Compose)
+We provide a production-ready stack running the FastAPI Governor alongside a dedicated OPA REST sidecar.
+```bash
+docker-compose up --build
+```
+This requires configuring `JWT_SECRET` via environment variables.
+
+### Option 2: Local Development (Python)
 
 ### Prerequisites
 
