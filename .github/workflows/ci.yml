@@ -43,3 +43,9 @@ jobs:
         export ARTIFACT_DIR=$(pwd)/
         python -m benchmarks.reproduce_0001b
         cat 0001b_reproduction.md
+
+    - name: Score Gateway with GASC-Audit
+      run: |
+        pip install git+https://github.com/andrebyrd-odingard/gasc-audit.git
+        python -c "from gasc_audit_engine import generate_conformance_report; report = generate_conformance_report(); print('\n\n## Conformance Score\n\n' + report)" >> README.md
+        cat README.md
