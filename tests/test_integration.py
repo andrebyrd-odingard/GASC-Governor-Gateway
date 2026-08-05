@@ -105,6 +105,7 @@ def test_integration_submit_lineage_failure():
     payload = create_valid_payload(parent_id="non-existent-parent")
     response = client.post("/submit-candidate", json=payload)
     
+
     assert response.status_code == 400
     assert "Lineage or Monotonicity Invalid" in response.json()["detail"]
 

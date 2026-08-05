@@ -51,6 +51,14 @@ class SqliteStateBackend(BaseStateBackend):
                 checkpoint_id TEXT PRIMARY KEY,
                 checkpoint_json TEXT
             )''')
+            
+            await db.execute('''CREATE TABLE IF NOT EXISTS external_effects (
+                idempotency_key TEXT PRIMARY KEY,
+                node_id TEXT,
+                effect_type TEXT,
+                recorded_at_utc TEXT
+            )''')
+            
             await db.commit()
 
     async def get_dag(self) -> Dict[str, Any]:
@@ -181,7 +189,17 @@ class SqliteStateBackend(BaseStateBackend):
             dag = await self.get_dag()
             checkpoints = await self.get_checkpoints()
             
+            semantic_rollback = await self.has_external_effects(c_p)
+            
             for comp_node in affected_compactions:
+                if semantic_rollback:
+                    await self._set_repair_candidate(db, comp_node, {
+                        "disposition": "IRREDUCIBLE",
+                        "reason": "semantic_rollback_hazard",
+                        "escalation_record": "Quarantined subgraph contains irreversible external effects"
+                    })
+                    continue
+                    
                 covers = dag[comp_node].get("covers", [])
                 
                 # R1: Admissible Frontier
@@ -255,6 +273,30 @@ class SqliteStateBackend(BaseStateBackend):
                 rows = await cursor.fetchall()
                 return {row[0]: json.loads(row[1]) for row in rows}
 
+    async def add_external_effect(self, idempotency_key: str, node_id: str, effect_type: str):
+        from datetime import datetime, timezone
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO external_effects (idempotency_key, node_id, effect_type, recorded_at_utc) VALUES (?, ?, ?, ?)",
+                (idempotency_key, node_id, effect_type, datetime.now(timezone.utc).isoformat() + "Z")
+            )
+            await db.commit()
+
+    async def check_external_effect(self, idempotency_key: str) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("SELECT 1 FROM external_effects WHERE idempotency_key = ?", (idempotency_key,)) as cursor:
+                row = await cursor.fetchone()
+                return row is not None
+
+    async def has_external_effects(self, node_ids: List[str]) -> bool:
+        if not node_ids:
+            return False
+        placeholders = ",".join(["?"] * len(node_ids))
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(f"SELECT 1 FROM external_effects WHERE node_id IN ({placeholders}) LIMIT 1", tuple(node_ids)) as cursor:
+                row = await cursor.fetchone()
+                return row is not None
+
     async def reset(self):
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("DELETE FROM nodes")
@@ -263,6 +305,7 @@ class SqliteStateBackend(BaseStateBackend):
             await db.execute("DELETE FROM quarantine_events")
             await db.execute("DELETE FROM repair_candidates")
             await db.execute("DELETE FROM checkpoints")
+            await db.execute("DELETE FROM external_effects")
             await db.commit()
             
         # Re-initialize basic data

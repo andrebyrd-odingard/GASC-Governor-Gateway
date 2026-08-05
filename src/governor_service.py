@@ -49,6 +49,20 @@ class CheckpointEvent(BaseModel):
     declared_at_utc: str
     snapshot_data: dict
 
+class ContextCompactedEvent(BaseModel):
+    compacted_node_ids: List[str]
+    compaction_node_id: str
+    timestamp_utc: str
+    ephemeral_nhi: dict
+    state_content: dict
+    agent_signature: str
+    method_id: str = "llm_summary"
+
+class ExternalEffectEvent(BaseModel):
+    idempotency_key: str
+    node_id: str
+    effect_type: str
+
 # --- State Backend Abstraction ---
 class BaseStateBackend(ABC):
     @abstractmethod
@@ -74,6 +88,12 @@ class BaseStateBackend(ABC):
     @abstractmethod
     async def add_checkpoint(self, checkpoint: dict): pass
     @abstractmethod
+    async def add_external_effect(self, idempotency_key: str, node_id: str, effect_type: str): pass
+    @abstractmethod
+    async def check_external_effect(self, idempotency_key: str) -> bool: pass
+    @abstractmethod
+    async def has_external_effects(self, node_ids: List[str]) -> bool: pass
+    @abstractmethod
     async def get_checkpoints(self) -> Dict[str, dict]: pass
     @abstractmethod
     async def reset(self): pass
@@ -89,6 +109,7 @@ class MemoryStateBackend(BaseStateBackend):
         self.quarantine_events = []
         self.repair_candidates = {}
         self.checkpoints = {}
+        self.external_effects = {}
         
     async def get_dag(self) -> Dict[str, Any]:
         async with self.lock: return self.dag.copy()
@@ -159,7 +180,21 @@ class MemoryStateBackend(BaseStateBackend):
                             affected_compactions.append(node_id)
             
             # R1 & R2
+            semantic_rollback = False
+            for effect in self.external_effects.values():
+                if effect["node_id"] in c_p:
+                    semantic_rollback = True
+                    break
+            
             for comp_node in affected_compactions:
+                if semantic_rollback:
+                    self.repair_candidates[comp_node] = {
+                        "disposition": "IRREDUCIBLE",
+                        "reason": "semantic_rollback_hazard",
+                        "escalation_record": "Quarantined subgraph contains irreversible external effects"
+                    }
+                    continue
+                    
                 covers = self.dag[comp_node].get("covers", [])
                 
                 # R1: Admissible Frontier
@@ -214,6 +249,25 @@ class MemoryStateBackend(BaseStateBackend):
                     
             return sorted(c_p)
 
+    async def add_external_effect(self, idempotency_key: str, node_id: str, effect_type: str):
+        async with self.lock:
+            self.external_effects[idempotency_key] = {
+                "node_id": node_id,
+                "effect_type": effect_type,
+                "recorded_at_utc": datetime.now(timezone.utc).isoformat() + "Z"
+            }
+
+    async def check_external_effect(self, idempotency_key: str) -> bool:
+        async with self.lock:
+            return idempotency_key in self.external_effects
+
+    async def has_external_effects(self, node_ids: List[str]) -> bool:
+        async with self.lock:
+            for effect in self.external_effects.values():
+                if effect["node_id"] in node_ids:
+                    return True
+            return False
+
     async def reset(self):
         async with self.lock: self._reset_sync()
 
@@ -239,6 +293,7 @@ def verify_nhi_jwt(token: str, payload_identity: str) -> dict:
             raise ValueError("JWT subject does not match payload identity")
         return claims
     except Exception as e:
+
         raise HTTPException(status_code=401, detail=f"Invalid Session Token: {str(e)}")
 
 def verify_role_jwt(request: Request, required_role: str) -> dict:
@@ -293,6 +348,7 @@ async def evaluate_opa_policy(policy_package: str, query: str, input_data: dict)
         *cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
     stdout, stderr = await process.communicate(input=json.dumps(input_data).encode())
+
     if process.returncode != 0: return False
     try:
         output = json.loads(stdout.decode())
@@ -363,6 +419,7 @@ async def submit_candidate(request: Request):
         "committed_dag_node_ids": list(dag.keys()),
         "write_request": payload
     }
+
     is_integrity_valid = await evaluate_opa_policy(
         "gasc/governor/integrity",
         "data.gasc.governor.integrity.allow_state_write",
@@ -422,6 +479,69 @@ async def submit_candidate(request: Request):
 
     await backend.commit_node(payload)
     return {"status": "success", "message": "State node committed to DAG."}
+
+@app.post("/declare-external-effect")
+async def declare_external_effect(event: ExternalEffectEvent, request: Request):
+    """
+    Records an external effect (e.g. API call, payment) to prevent semantic rollbacks.
+    The agent must declare external effects so they can't be replayed across quarantine.
+    """
+    verify_role_jwt(request, "admin")  # Only trusted services can declare effects
+    await backend.add_external_effect(event.idempotency_key, event.node_id, event.effect_type)
+    return {"status": "success", "message": "External effect recorded."}
+
+@app.post("/context-compacted")
+async def declare_context_compacted(event: ContextCompactedEvent, request: Request):
+    """
+    ACP Extension: Translates an LLM context compaction event into a trackable
+    COMPACTION node in the DAG, turning the untracked carry channel into a tracked read.
+    """
+    dag = await backend.get_dag()
+    
+    parent_commitments = []
+    for nid in event.compacted_node_ids:
+        if nid not in dag:
+            raise HTTPException(status_code=400, detail=f"Compacted node {nid} not found in DAG")
+        p_hash = dag[nid].get("content_digest_sha256", "0"*64)
+        parent_commitments.append({
+            "parent_node_id": nid,
+            "parent_content_hash": p_hash,
+            "edge_class": "CARRIED"
+        })
+        
+    content_str = json.dumps(event.state_content, sort_keys=True)
+    actual_hash = hashlib.sha256(content_str.encode()).hexdigest()
+    
+    payload = {
+        "payload_id": event.compaction_node_id,
+        "node_type": "COMPACTION",
+        "timestamp_utc": event.timestamp_utc,
+        "ephemeral_nhi": event.ephemeral_nhi,
+        "declared_evidence_boundary": {
+            "boundary_id": f"bnd-{event.compaction_node_id}",
+            "fixed_at_utc": event.timestamp_utc,
+            "boundary_digest": "0"*64
+        },
+        "state_content": event.state_content,
+        "content_digest_sha256": actual_hash,
+        "agent_signature": event.agent_signature,
+        "covers": event.compacted_node_ids,
+        "parent_dependency_commitments": parent_commitments,
+        "summarizer": {
+            "method_id": event.method_id,
+            "config_digest": "0"*64
+        }
+    }
+    
+    token = payload.get("ephemeral_nhi", {}).get("session_token")
+    identity_id = payload.get("ephemeral_nhi", {}).get("identity_id")
+    verify_nhi_jwt(token, identity_id)
+    
+    if not verify_cryptographic_signature(payload):
+        raise HTTPException(status_code=401, detail="Cryptographic signature verification failed")
+        
+    await backend.commit_node(payload)
+    return {"status": "success", "message": "Compaction node committed to DAG."}
 
 @app.post("/checkpoint")
 async def declare_checkpoint(event: CheckpointEvent, request: Request):
