@@ -28,23 +28,19 @@ def backend_setup(request, monkeypatch, tmp_path):
         from src.sqlite_backend import SqliteStateBackend
         db_path = str(tmp_path / "test_state.db")
         test_backend = SqliteStateBackend(db_path=db_path)
-        
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-        if loop.is_running():
+            loop = None
+
+        if loop and loop.is_running():
             import threading
             def run_init():
-                new_loop = asyncio.new_event_loop()
-                new_loop.run_until_complete(test_backend.init_db())
-                new_loop.close()
+                asyncio.run(test_backend.init_db())
             t = threading.Thread(target=run_init)
             t.start()
             t.join()
         else:
-            loop.run_until_complete(test_backend.init_db())
+            asyncio.run(test_backend.init_db())
             
     import src.governor_service; monkeypatch.setattr(src.governor_service, "backend", test_backend)
