@@ -26,7 +26,7 @@ This gateway sits between your AI Agent orchestration frameworks and your shared
 *   **Verification Separation (OPA)**: Uses embedded Open Policy Agent (Rego) policies to ensure agents cannot authorize their own reintegration using evaluative outputs (e.g., planner scores or justifications).
 *   **Cryptographic Binding**: Enforces ECDSA signature verification and JWT validation to guarantee identity and payload integrity.
 *   **Historical Monotonicity**: Quarantine ledgers are append-only. Taint facts are never erased, ensuring true auditability.
-*   **Fail-Closed Irreducibility**: Instead of fabricating a recovery that breaks safety invariants, the system escalates irreducible faults for human review.
+*   **Fail-Closed Irreducibility**: Instead of fabricating a recovery that breaks safety invariants, the system escalates irreducible faults for human review (Note: since this Gateway lacks an internal LLM to perform reconstruction, irreducibility is currently a constant outcome rather than an exercised failure mode).
 
 ## Threat Model Boundary (What This Does NOT Do)
 

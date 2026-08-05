@@ -205,6 +205,36 @@ async def evaluate_opa_policy(policy_package: str, query: str, input_data: dict)
         return output.get("result", [{}])[0].get("expressions", [{}])[0].get("value", False)
     except: return False
 
+def _compute_covers_diff(dag, covers):
+    if not covers: return []
+    covers_set = set(covers)
+    
+    # D_covers: nodes reachable FROM any node in covers
+    d_covers = set(covers)
+    queue = list(covers)
+    while queue:
+        curr = queue.pop(0)
+        for node_id, data in dag.items():
+            parents = [p["parent_node_id"] for p in data.get("parent_dependency_commitments", [])]
+            if curr in parents and node_id not in d_covers:
+                d_covers.add(node_id)
+                queue.append(node_id)
+                
+    # A_covers: nodes that can REACH any node in covers
+    a_covers = set(covers)
+    queue = list(covers)
+    while queue:
+        curr = queue.pop(0)
+        curr_data = dag.get(curr, {})
+        parents = [p["parent_node_id"] for p in curr_data.get("parent_dependency_commitments", [])]
+        for p_id in parents:
+            if p_id in dag and p_id not in a_covers:
+                a_covers.add(p_id)
+                queue.append(p_id)
+                
+    interval = d_covers.intersection(a_covers)
+    return sorted(list(interval - covers_set))
+
 # --- Routes ---
 @app.post("/submit-candidate")
 async def submit_candidate(request: Request):
@@ -225,15 +255,12 @@ async def submit_candidate(request: Request):
     if not verify_cryptographic_signature(payload):
         raise HTTPException(status_code=401, detail="Cryptographic signature verification failed")
 
-    # Topological Coverage Diff (if COMPACTION)
-    if payload.get("node_type") == "COMPACTION":
-        # Simplified coverage diff computation for PoC.
-        # In a full implementation, this finds nodes physically situated between the 
-        # earliest and latest covered nodes that were omitted from `covers`.
-        payload["covers_diff"] = [] 
-
     q_ledger = await backend.get_quarantine_ledger()
     dag = await backend.get_dag()
+
+    # Topological Coverage Diff (if COMPACTION)
+    if payload.get("node_type") == "COMPACTION":
+        payload["covers_diff"] = _compute_covers_diff(dag, payload.get("covers", [])) 
     
     # 1. Lineage & Monotonicity
     integrity_input = {
