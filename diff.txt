@@ -1,0 +1,67 @@
+diff --git a/requirements.txt b/requirements.txt
+index b32555a..22ac282 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -9,3 +9,4 @@ ecdsa==0.19.2
+ cryptography==50.0.0
+ pydantic-settings==2.14.2
+ respx
++litellm>=1.0.0
+diff --git a/src/governor_service.py b/src/governor_service.py
+index 5b15530..e007d7b 100644
+--- a/src/governor_service.py
++++ b/src/governor_service.py
+@@ -454,11 +454,16 @@ async def designate_poison(event: DesignationEvent, request: Request):
+                 
+             try:
+                 # POST to adapter
++                compaction_covers = dag[comp_node].get("covers", [])
+                 async with httpx.AsyncClient() as client:
+                     resp = await client.post(
+                         f"{settings.RECOVERY_ADAPTER_URL}/reconstruct",
+                         json={
+-                            "frontier": rc_data["frontier"],
++                            "graph_snapshot": dag,
++                            "quarantine_ledger": q_ledger,
++                            "poisoned_root_id": event.poisoned_node_id,
++                            "compaction_covers": compaction_covers,
++                            "requested_frontier": rc_data["frontier"],
+                             "method": rc_data["method"],
+                             "checkpoint": rc_data["checkpoint"]
+                         },
+@@ -533,3 +538,35 @@ async def reset_db(request: Request):
+         raise HTTPException(status_code=403, detail="Debug endpoints disabled in production")
+     await backend.reset()
+     return {"status": "ok"}
++
++@app.get("/reducibility-report")
++async def get_reducibility_report(request: Request):
++    verify_role_jwt(request, "admin")
++    repair_candidates = await backend.get_repair_candidates()
++    
++    total = len(repair_candidates)
++    reducible_count = 0
++    irreducible_count = 0
++    reasons = {}
++    
++    for rc in repair_candidates.values():
++        disp = rc.get("disposition")
++        if disp == "REDUCIBLE":
++            reducible_count += 1
++        elif disp == "IRREDUCIBLE":
++            irreducible_count += 1
++            reason = rc.get("reason", "unknown")
++            reasons[reason] = reasons.get(reason, 0) + 1
++            
++    return {
++        "total_compactions_processed": total,
++        "reducible": {
++            "count": reducible_count,
++            "fraction": reducible_count / total if total > 0 else 0.0
++        },
++        "irreducible": {
++            "count": irreducible_count,
++            "fraction": irreducible_count / total if total > 0 else 0.0,
++            "reasons": reasons
++        }
++    }
