@@ -1,21 +1,51 @@
 import pytest
 from fastapi.testclient import TestClient
-from src.governor_service import app
+from src.governor_service import app, settings
 import uuid
+import json
+import hashlib
+import jwt
+from datetime import datetime, timezone
+from ecdsa import SigningKey, NIST256p
 
 client = TestClient(app)
+
+# Generate a consistent keypair for tests
+sk = SigningKey.generate(curve=NIST256p)
+vk = sk.verifying_key
+PUBLIC_KEY_HEX = vk.to_string().hex()
 
 @pytest.fixture(autouse=True)
 def reset_db():
     client.post("/reset-db")
 
 def create_valid_payload(parent_id="clean-parent-1"):
+    # Create valid JWT
+    session_token = jwt.encode(
+        {
+            "sub": PUBLIC_KEY_HEX, 
+            "scope": "agent:state:reconstruct",
+            "is_nhi": True,
+            "expires_at_epoch": int(datetime.now(timezone.utc).timestamp()) + 3600
+        },
+        settings.JWT_SECRET,
+        algorithm="HS256"
+    )
+
+    state_content = {"action": "create_order"}
+    content_str = json.dumps(state_content, sort_keys=True)
+    actual_hash = hashlib.sha256(content_str.encode()).hexdigest()
+
+    # Sign the actual hash
+    signature_bytes = sk.sign(actual_hash.encode())
+    signature_hex = signature_bytes.hex()
+
     return {
         "payload_id": str(uuid.uuid4()),
         "timestamp_utc": "2026-10-27T10:00:00Z",
         "ephemeral_nhi": {
-            "identity_id": "agent-1",
-            "session_token": "token",
+            "identity_id": PUBLIC_KEY_HEX,
+            "session_token": session_token,
             "expires_at_utc": "2026-10-27T11:00:00Z"
         },
         "declared_evidence_boundary": {
@@ -27,9 +57,9 @@ def create_valid_payload(parent_id="clean-parent-1"):
             "parent_node_id": parent_id,
             "parent_content_hash": "e" * 64
         }],
-        "state_content": {"action": "create_order"},
-        "content_digest_sha256": "d" * 64,
-        "agent_signature": "signature"
+        "state_content": state_content,
+        "content_digest_sha256": actual_hash,
+        "agent_signature": signature_hex
     }
 
 def test_integration_submit_valid_payload():
@@ -42,8 +72,21 @@ def test_integration_submit_valid_payload():
     db_state = client.get("/db-state").json()
     assert payload["payload_id"] in db_state["dag"]
 
+def test_integration_submit_invalid_signature():
+    payload = create_valid_payload()
+    payload["agent_signature"] = "deadbeef" * 8  # invalid sig
+    response = client.post("/submit-candidate", json=payload)
+    assert response.status_code == 401
+    assert "Cryptographic signature verification failed" in response.json()["detail"]
+
+def test_integration_submit_invalid_jwt():
+    payload = create_valid_payload()
+    payload["ephemeral_nhi"]["session_token"] = "invalid.jwt.token"
+    response = client.post("/submit-candidate", json=payload)
+    assert response.status_code == 401
+    assert "Invalid Session Token" in response.json()["detail"]
+
 def test_integration_submit_lineage_failure():
-    # Provide a parent that doesn't exist
     payload = create_valid_payload(parent_id="non-existent-parent")
     response = client.post("/submit-candidate", json=payload)
     
@@ -51,20 +94,26 @@ def test_integration_submit_lineage_failure():
     assert "Lineage or Monotonicity Invalid" in response.json()["detail"]
 
 def test_integration_submit_tainted_parent():
-    # Use a parent known to be in the quarantine ledger
     payload = create_valid_payload(parent_id="quarantined-node-A")
     response = client.post("/submit-candidate", json=payload)
     
-    # Should get 403 and the event should be logged
     assert response.status_code == 403
     error_detail = response.json()["detail"]
     assert error_detail["error"] == "TAINTED_PARENT"
     assert error_detail["event"]["poisoned_root_id"] == "quarantined-node-A"
+    # Ensure blast radius is dynamically calculated (including the attempted node)
+    assert payload["payload_id"] in error_detail["event"]["computed_blast_radius_C_p"]
+    assert "quarantined-node-A" in error_detail["event"]["computed_blast_radius_C_p"]
 
 def test_integration_submit_verification_failure():
-    # Payload valid structurally, but has forbidden "justification" output
     payload = create_valid_payload()
     payload["state_content"]["justification"] = "Because I said so"
+    
+    # Must resign because content changed
+    content_str = json.dumps(payload["state_content"], sort_keys=True)
+    actual_hash = hashlib.sha256(content_str.encode()).hexdigest()
+    payload["content_digest_sha256"] = actual_hash
+    payload["agent_signature"] = sk.sign(actual_hash.encode()).hex()
     
     response = client.post("/submit-candidate", json=payload)
     

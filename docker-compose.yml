@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  governor_gateway:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - OPA_URL=http://opa:8181
+      - JWT_SECRET=production_secret_key_here
+    depends_on:
+      - opa
+
+  opa:
+    image: openpolicyagent/opa:0.61.0
+    ports:
+      - "8181:8181"
+    command:
+      - "run"
+      - "--server"
+      - "--addr=0.0.0.0:8181"
+      - "/policies"
+    volumes:
+      - ./policies:/policies:ro
