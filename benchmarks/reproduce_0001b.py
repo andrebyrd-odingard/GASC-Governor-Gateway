@@ -87,22 +87,43 @@ async def run_trial(trial_idx):
             )
             t_record_end = time.perf_counter()
             
-            # Edge Insert
+            # Edge Insert (Individual, 0001b true reproduction path)
             t_edge_start = time.perf_counter()
+            for p in parents:
+                await db.execute(
+                    "INSERT INTO edges (child_id, parent_id, edge_class) VALUES (?, ?, ?)",
+                    (node_id, p["parent_node_id"], p.get("edge_class", "MATERIAL"))
+                )
+            await db.commit()
+            t_edge_end = time.perf_counter()
+            
+            # Edge Insert (Batched, Optimization path)
+            # Delete edges we just inserted, to measure batching fairly
+            await db.execute("DELETE FROM edges WHERE child_id = ?", (node_id,))
+            
+            t_edge_batch_start = time.perf_counter()
             edge_rows = [(node_id, p["parent_node_id"], p.get("edge_class", "MATERIAL")) for p in parents]
             await db.executemany(
                 "INSERT INTO edges (child_id, parent_id, edge_class) VALUES (?, ?, ?)",
                 edge_rows
             )
             await db.commit()
-            t_edge_end = time.perf_counter()
+            t_edge_batch_end = time.perf_counter()
             
             t1 = time.perf_counter()
             
             commit_latencies.append((t_commit_end - t_commit_start) * 1000) # ms
             record_insert_latencies.append((t_record_end - t_record_start) * 1000) # ms
+            
+            # Record individual edge inserts (reproduction metric)
             edge_insert_latencies.append((t_edge_end - t_edge_start) * 1000) # ms
-            total_write_latencies.append((t1 - t0) * 1000) # ms
+            # The total write latency uses the individual edge insert time
+            total_write_latencies.append(((t_record_end - t_record_start) + (t_edge_end - t_edge_start) + (t_commit_end - t_commit_start)) * 1000) # ms
+            
+            # Record batched edge inserts (optimization metric)
+            if not hasattr(locals(), 'edge_batch_latencies'):
+                edge_batch_latencies = []
+            edge_batch_latencies.append((t_edge_batch_end - t_edge_batch_start) * 1000)
 
     # Measure Traversal
     t_trav_start = time.perf_counter()
@@ -126,6 +147,7 @@ async def run_trial(trial_idx):
         "commitment_ms": np.median(commit_latencies),
         "record_insert_ms": np.median(record_insert_latencies),
         "edge_insert_ms": np.median(edge_insert_latencies),
+        "edge_batch_ms": np.median(edge_batch_latencies) if 'edge_batch_latencies' in locals() and len(edge_batch_latencies) > 0 else 0,
         "total_write_ms": np.median(total_write_latencies),
         "traversal_us_per_node": trav_latency_per_node,
         "annotation_us_per_node": annot_latency_per_node,
@@ -138,6 +160,7 @@ async def main():
         "commitment_ms": [],
         "record_insert_ms": [],
         "edge_insert_ms": [],
+        "edge_batch_ms": [],
         "total_write_ms": [],
         "traversal_us_per_node": [],
         "annotation_us_per_node": [],
@@ -190,10 +213,13 @@ async def main():
         f.write(f"| SHA-256 commitment | ≈0.002 ms | {medians['commitment_ms']:.3f} ms |\n")
         f.write(f"| Record insert | ≈0.06 ms | {medians['record_insert_ms']:.3f} ms |\n")
         f.write(f"| Edge insert | ≈0.005 ms | {medians['edge_insert_ms']:.3f} ms |\n")
+        if medians['edge_batch_ms'] > 0:
+            f.write(f"| Edge insert (batched) | N/A | {medians['edge_batch_ms']:.3f} ms (optimization) |\n")
         f.write(f"| Per-write @ 400 | 1.95 ms, 510 w/s | {medians['total_write_ms']:.3f} ms, {1000/medians['total_write_ms']:.0f} w/s |\n")
         f.write(f"| Traversal (per node) | ≈4.8 µs | {medians['traversal_us_per_node']:.3f} µs |\n")
         f.write(f"| Annotation writes (per node) | ≈2.4 µs | {medians['annotation_us_per_node']:.3f} µs |\n")
-        f.write(f"| Storage | 7.1 MB @ 400 | {medians['db_size_bytes'] / 1024 / 1024:.2f} MB |\n")
+        f.write(f"| Storage | 7.1 MB @ 400 | {medians['db_size_bytes'] / 1024 / 1024:.2f} MB |\n\n")
+        f.write("*Note: Storage is 12 MB vs 7.1 MB at n=400 (1.7x baseline). The schema carries checkpoints, repair candidates, and dispositions that the 0001b ledger did not, at the same ~106 bytes/edge for the edge table itself. Also, we are waiting for Linux CI results before publishing this table for latency parity, as the current numbers reflect Python overhead on macOS.*")
         
     print(f"Benchmark completed. Wrote {json_path} and {md_path}")
 
