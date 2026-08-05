@@ -41,5 +41,5 @@ jobs:
     - name: Run SQLite Benchmarks
       run: |
         export ARTIFACT_DIR=$(pwd)/
-        python benchmarks/reproduce_0001b.py
+        PYTHONPATH=$(pwd) python benchmarks/reproduce_0001b.py
         cat 0001b_reproduction.md
