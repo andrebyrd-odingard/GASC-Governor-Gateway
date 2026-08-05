@@ -15,3 +15,36 @@ JWT_PRIVATE_KEY_PEM = jwt_private_key.private_bytes(
 
 os.environ["JWT_PUBLIC_KEY"] = JWT_PUBLIC_KEY
 os.environ["DEBUG_MODE"] = "true"
+
+import pytest
+import asyncio
+
+
+@pytest.fixture(params=["memory", "sqlite"], autouse=True)
+def backend_setup(request, monkeypatch, tmp_path):
+    if request.param == "memory":
+        from src.governor_service import MemoryStateBackend; test_backend = MemoryStateBackend()
+    else:
+        from src.sqlite_backend import SqliteStateBackend
+        db_path = str(tmp_path / "test_state.db")
+        test_backend = SqliteStateBackend(db_path=db_path)
+        
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+        if loop.is_running():
+            import threading
+            def run_init():
+                new_loop = asyncio.new_event_loop()
+                new_loop.run_until_complete(test_backend.init_db())
+                new_loop.close()
+            t = threading.Thread(target=run_init)
+            t.start()
+            t.join()
+        else:
+            loop.run_until_complete(test_backend.init_db())
+            
+    import src.governor_service; monkeypatch.setattr(src.governor_service, "backend", test_backend)
