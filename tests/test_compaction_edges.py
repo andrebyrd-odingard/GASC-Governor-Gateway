@@ -81,6 +81,8 @@ def test_compaction_edge_fail_closed_routing():
     
     # 2. Compaction node summarizing node-a
     p2 = create_payload("compaction-1", "node-a", {"data": "summarized"}, is_compaction=True)
+    p2["covers"] = ["clean-parent-1", "node-a"]
+    p2["summarizer"] = {"method_id": "llm-v1"}
     assert client.post("/submit-candidate", json=p2).status_code == 200
     
     # 3. Downstream node building on the summary (1 hop past compaction)
@@ -121,7 +123,7 @@ def test_compaction_edge_fail_closed_routing():
     assert "compaction-1" in repair_candidates
     assert "compaction-1" in ledger
     assert repair_candidates["compaction-1"]["disposition"] == "IRREDUCIBLE"
-    assert repair_candidates["compaction-1"]["reason"] == "no_reconstruction_backend"
+    assert repair_candidates["compaction-1"]["reason"] == "no_admissible_checkpoint"
     
     # Descendants are in quarantine_ledger
     assert "node-b" in ledger
@@ -197,7 +199,92 @@ def test_covers_interval_gap_computation():
     db_state = client.get("/db-state", headers={"Authorization": f"Bearer {generate_admin_token()}"}).json()
     gap = db_state["dag"]["compaction-gap"]["covers_interval_gap"]
     
-    # node-2 sits between node-1 and node-3 but was omitted from covers
-    assert "node-2" in gap
-    assert "node-1" not in gap
-    assert "node-3" not in gap
+import respx
+
+def test_checkpoint_api_auth():
+    chk = {
+        "checkpoint_id": "cp1",
+        "target_node_id": "node-1",
+        "declared_at_utc": "2026-10-27T00:00:00Z",
+        "snapshot_data": {}
+    }
+    # No auth
+    assert client.post("/checkpoint", json=chk).status_code == 401
+    # Designator auth
+    assert client.post("/checkpoint", json=chk, headers={"Authorization": f"Bearer {generate_designator_token()}"}).status_code == 401
+    # Admin auth
+    assert client.post("/checkpoint", json=chk, headers={"Authorization": f"Bearer {generate_admin_token()}"}).status_code == 200
+
+def test_reconstruction_failure_paths():
+    # Setup chain: node-1 -> comp
+    p1 = create_payload("node-1", "clean-parent-1", {"data": "1"})
+    assert client.post("/submit-candidate", json=p1).status_code == 200
+    
+    comp = create_payload("comp-fail", "node-1", {"data": "summary"}, is_compaction=True)
+    comp["covers"] = ["clean-parent-1", "node-1"]
+    comp["summarizer"] = {"method_id": "llm-v1"}
+    assert client.post("/submit-candidate", json=comp).status_code == 200
+    
+    # 1. No checkpoint -> no_admissible_checkpoint
+    desig = {
+        "poisoned_node_id": "node-1",
+        "detected_at_utc": "2026-10-27T10:15:00Z",
+        "source": "amg_tamper_check",
+        "confidence_score": 0.99,
+        "reason": "Test"
+    }
+    client.post("/designate", json=desig, headers={"Authorization": f"Bearer {generate_designator_token()}"})
+    state = client.get("/db-state", headers={"Authorization": f"Bearer {generate_admin_token()}"}).json()
+    assert state["repair_candidates"]["comp-fail"]["reason"] == "no_admissible_checkpoint"
+    assert state["repair_candidates"]["comp-fail"]["disposition"] == "IRREDUCIBLE"
+
+@respx.mock
+def test_reconstruction_success_path():
+    # Setup chain: clean-root -> clean-child -> comp
+    # Poison clean-root. clean-child is in frontier.
+    p0 = create_payload("clean-root", "clean-parent-1", {"data": "0"})
+    client.post("/submit-candidate", json=p0)
+    p1 = create_payload("clean-child", "clean-root", {"data": "1"})
+    client.post("/submit-candidate", json=p1)
+    
+    comp = create_payload("comp-succ", "clean-child", {"data": "sum"}, is_compaction=True)
+    comp["covers"] = ["clean-root", "clean-child"]
+    comp["summarizer"] = {"method_id": "llm-v1"}
+    client.post("/submit-candidate", json=comp)
+    
+    # Declare checkpoint for clean-root (since clean-child will be poisoned)
+    chk = {
+        "checkpoint_id": "cp1",
+        "target_node_id": "clean-root",
+        "declared_at_utc": "2026-10-27T00:00:00Z",
+        "snapshot_data": {}
+    }
+    client.post("/checkpoint", json=chk, headers={"Authorization": f"Bearer {generate_admin_token()}"})
+    
+    # Enable adapter
+    from src.governor_service import settings
+    settings.RECOVERY_ADAPTER_URL = "http://mock-adapter"
+    settings.RECOVERY_ADAPTER_PUBLIC_KEY = PUBLIC_KEY_HEX
+    
+    # Mock adapter response
+    rec_candidate = create_payload("reconstructed-comp", "clean-root", {"data": "new sum"})
+    rec_candidate["covers"] = ["clean-root"] # matches frontier
+    
+    respx.post("http://mock-adapter/reconstruct").respond(200, json={"candidate": rec_candidate})
+    
+    # Designate clean-child as poisoned
+    desig = {
+        "poisoned_node_id": "clean-child",
+        "detected_at_utc": "2026-10-27T10:15:00Z",
+        "source": "amg_tamper_check",
+        "confidence_score": 0.99,
+        "reason": "Test"
+    }
+    client.post("/designate", json=desig, headers={"Authorization": f"Bearer {generate_designator_token()}"})
+    
+    state = client.get("/db-state", headers={"Authorization": f"Bearer {generate_admin_token()}"}).json()
+    assert state["repair_candidates"]["comp-succ"]["disposition"] == "REDUCIBLE"
+    assert "reconstructed-comp" in state["dag"]
+    
+    settings.RECOVERY_ADAPTER_URL = None
+

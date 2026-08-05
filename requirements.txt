@@ -8,3 +8,4 @@ PyJWT==2.13.0
 ecdsa==0.19.2
 cryptography==50.0.0
 pydantic-settings==2.14.2
+respx
