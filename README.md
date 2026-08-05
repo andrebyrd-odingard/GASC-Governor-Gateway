@@ -2,7 +2,19 @@
 
 The **GASC-Governor-Gateway** is a lightweight, fail-closed policy enforcement sidecar that isolates AI agents and prevents cascading failures via Transitive Taint Propagation.
 
-It implements the [GASC-ED v1.1 Engineering Architecture & Policy-as-Code Specification](https://example.com/placeholder-gasc-ed-spec) and enforces rules based on the **Containment Survivability Research (CSR) Program** (specifically CSR-PUB-0005).
+It implements the [GASC-ED v1.1 Engineering Architecture & Policy-as-Code Specification](https://example.com/placeholder-gasc-ed-spec) and enforces rules based on the **Containment Survivability Research (CSR) Program**.
+
+## 🔬 About the CSR Program
+
+The **Containment Survivability Research (CSR) Program** is an independent, multi-stage research initiative authored by **Andre Byrd** under **Six Sense Enterprise Services LLC (Odingard Security)**. 
+
+The program was designed to rigorously study how contamination spreads in shared AI agent environments. It culminated in the **CSR-PUB-0005** capstone paper, which synthesized the findings into a unified framework for:
+1. Defining transitive taint propagation.
+2. Specifying "Containment Denial-of-Service" as an adversarial attack.
+3. Measuring the cost of correctly isolating compromised agents.
+4. Engineering "Governed Recovery" to safely rebuild state.
+
+This repository is the practical software implementation of those findings.
 
 ## 🛡️ Core Capabilities
 
