@@ -18,14 +18,8 @@ from pydantic import BaseModel
 from enum import Enum
 
 # --- Settings ---
-class Settings(BaseSettings):
-    OPA_URL: str | None = None # e.g. http://localhost:8181
-    JWT_PUBLIC_KEY: str
-    DEBUG_MODE: bool = False
-    RECOVERY_ADAPTER_URL: str | None = None
-    RECOVERY_ADAPTER_PUBLIC_KEY: str | None = None
+from src.config import settings
 
-settings = Settings()
 
 ROOT_DIR = Path(__file__).parent.parent
 POLICIES_DIR = ROOT_DIR / "policies"
@@ -64,11 +58,17 @@ class BaseStateBackend(ABC):
     @abstractmethod
     async def get_repair_candidates(self) -> Dict[str, Any]: pass
     @abstractmethod
+    async def update_repair_candidate(self, node_id: str, data: dict): pass
+    @abstractmethod
     async def commit_node(self, payload: dict): pass
     @abstractmethod
     async def log_quarantine_event(self, event: dict): pass
     @abstractmethod
     async def add_to_quarantine_ledger(self, node_id: str): pass
+    @abstractmethod
+    async def apply_quarantine_transaction(self, event: dict, c_p: List[str]): pass
+    @abstractmethod
+    async def get_quarantine_events(self) -> List[dict]: pass
     @abstractmethod
     async def compute_blast_radius(self, poisoned_root_id: str) -> List[str]: pass
     @abstractmethod
@@ -99,6 +99,9 @@ class MemoryStateBackend(BaseStateBackend):
     async def get_repair_candidates(self) -> Dict[str, Any]:
         async with self.lock: return dict(self.repair_candidates)
         
+    async def update_repair_candidate(self, node_id: str, data: dict):
+        async with self.lock: self.repair_candidates[node_id] = data
+        
     async def commit_node(self, payload: dict):
         async with self.lock: self.dag[payload["payload_id"]] = payload
         
@@ -109,6 +112,16 @@ class MemoryStateBackend(BaseStateBackend):
         async with self.lock:
             if node_id not in self.quarantine_ledger:
                 self.quarantine_ledger.append(node_id)
+                
+    async def apply_quarantine_transaction(self, event: dict, c_p: List[str]):
+        async with self.lock:
+            self.quarantine_events.append(event)
+            for node_id in c_p:
+                if node_id not in self.quarantine_ledger:
+                    self.quarantine_ledger.append(node_id)
+                    
+    async def get_quarantine_events(self) -> List[dict]:
+        async with self.lock: return list(self.quarantine_events)
                 
     async def add_checkpoint(self, checkpoint: dict):
         async with self.lock: self.checkpoints[checkpoint["checkpoint_id"]] = checkpoint
@@ -204,8 +217,19 @@ class MemoryStateBackend(BaseStateBackend):
     async def reset(self):
         async with self.lock: self._reset_sync()
 
-backend = MemoryStateBackend()
+if settings.BACKEND_TYPE == "sqlite":
+    from src.sqlite_backend import SqliteStateBackend
+    backend = SqliteStateBackend()
+else:
+    backend = MemoryStateBackend()
+
 app = FastAPI()
+
+@app.on_event("startup")
+async def startup_event():
+    if hasattr(backend, "init_db"):
+        await backend.init_db()
+
 
 # --- Security Checks ---
 def verify_nhi_jwt(token: str, payload_identity: str) -> dict:
@@ -366,8 +390,7 @@ async def submit_candidate(request: Request):
                 "independent_snapshot_hash": independent_snapshot_hash,
                 "monotonic_ledger_digest_post_transition": monotonic_ledger_digest
             }
-            await backend.log_quarantine_event(event)
-            await backend.add_to_quarantine_ledger(payload.get("payload_id"))
+            await backend.apply_quarantine_transaction(event, [payload.get("payload_id")])
             raise HTTPException(status_code=403, detail={"error": "TAINTED_PARENT", "event": event})
             
         raise HTTPException(status_code=400, detail="Lineage or Monotonicity Invalid")
@@ -425,10 +448,8 @@ async def designate_poison(event: DesignationEvent, request: Request):
     
     independent_snapshot_hash = hashlib.sha256(json.dumps(dag, sort_keys=True).encode()).hexdigest()
     
-    for node in c_p:
-        await backend.add_to_quarantine_ledger(node)
-            
-    updated_ledger = await backend.get_quarantine_ledger()
+    # Calculate what the ledger digest will be
+    updated_ledger = list(set(q_ledger + c_p))
     monotonic_ledger_digest = hashlib.sha256(json.dumps(updated_ledger, sort_keys=True).encode()).hexdigest()
     
     q_event = {
@@ -441,7 +462,7 @@ async def designate_poison(event: DesignationEvent, request: Request):
         "designator_identity": claims.get("sub"),
         "designation_reason": event.reason
     }
-    await backend.log_quarantine_event(q_event)
+    await backend.apply_quarantine_transaction(q_event, c_p)
     
     # R3: Attempt external reconstruction
     repair_candidates = await backend.get_repair_candidates()
@@ -450,6 +471,7 @@ async def designate_poison(event: DesignationEvent, request: Request):
             if not settings.RECOVERY_ADAPTER_URL:
                 rc_data["disposition"] = "IRREDUCIBLE"
                 rc_data["reason"] = "no_reconstruction_backend"
+                await backend.update_repair_candidate(comp_node, rc_data)
                 continue
                 
             try:
@@ -479,6 +501,7 @@ async def designate_poison(event: DesignationEvent, request: Request):
                 if resp.status_code != 200:
                     rc_data["disposition"] = "IRREDUCIBLE"
                     rc_data["reason"] = "backend_unavailable"
+                    await backend.update_repair_candidate(comp_node, rc_data)
                     continue
                     
                 candidate = resp.json().get("candidate", {})
@@ -488,12 +511,14 @@ async def designate_poison(event: DesignationEvent, request: Request):
                 if not candidate:
                     rc_data["disposition"] = "IRREDUCIBLE"
                     rc_data["reason"] = "backend_unavailable"
+                    await backend.update_repair_candidate(comp_node, rc_data)
                     continue
                     
                 # The candidate should be signed by the adapter
                 if not verify_cryptographic_signature(candidate):
                     rc_data["disposition"] = "IRREDUCIBLE"
                     rc_data["reason"] = "invalid_signature"
+                    await backend.update_repair_candidate(comp_node, rc_data)
                     continue
                     
                 # R4 Identity Verification: Signature must match RECOVERY_ADAPTER_PUBLIC_KEY
@@ -501,12 +526,14 @@ async def designate_poison(event: DesignationEvent, request: Request):
                 if not adapter_key or candidate.get("ephemeral_nhi", {}).get("identity_id") != adapter_key:
                     rc_data["disposition"] = "IRREDUCIBLE"
                     rc_data["reason"] = "invalid_identity"
+                    await backend.update_repair_candidate(comp_node, rc_data)
                     continue
                     
                 # R4 Frontier Verification
                 if set(candidate.get("covers", [])) != set(rc_data["frontier"]):
                     rc_data["disposition"] = "IRREDUCIBLE"
                     rc_data["reason"] = "frontier_mismatch"
+                    await backend.update_repair_candidate(comp_node, rc_data)
                     continue
                     
                 # R5 Reintegration Gate (Simplified, in real system this is an OPA call)
@@ -515,6 +542,7 @@ async def designate_poison(event: DesignationEvent, request: Request):
                 await backend.commit_node(candidate)
                 rc_data["disposition"] = "REDUCIBLE"
                 rc_data["reconstructed_node_id"] = candidate.get("payload_id")
+                await backend.update_repair_candidate(comp_node, rc_data)
                 
             except httpx.ReadTimeout:
                 rc_data["disposition"] = "IRREDUCIBLE"
@@ -533,7 +561,7 @@ async def get_db_state(request: Request):
     return {
         "dag": await backend.get_dag(),
         "quarantine_ledger": await backend.get_quarantine_ledger(),
-        "quarantine_events": backend.quarantine_events,
+        "quarantine_events": await backend.get_quarantine_events(),
         "repair_candidates": await backend.get_repair_candidates()
     }
 
