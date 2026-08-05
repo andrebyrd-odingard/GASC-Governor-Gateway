@@ -205,7 +205,7 @@ async def evaluate_opa_policy(policy_package: str, query: str, input_data: dict)
         return output.get("result", [{}])[0].get("expressions", [{}])[0].get("value", False)
     except: return False
 
-def _compute_covers_diff(dag, covers):
+def _compute_covers_interval_gap(dag, covers):
     if not covers: return []
     covers_set = set(covers)
     
@@ -258,9 +258,9 @@ async def submit_candidate(request: Request):
     q_ledger = await backend.get_quarantine_ledger()
     dag = await backend.get_dag()
 
-    # Topological Coverage Diff (if COMPACTION)
+    # Topological Interval Gap (if COMPACTION)
     if payload.get("node_type") == "COMPACTION":
-        payload["covers_diff"] = _compute_covers_diff(dag, payload.get("covers", [])) 
+        payload["covers_interval_gap"] = _compute_covers_interval_gap(dag, payload.get("covers", [])) 
     
     # 1. Lineage & Monotonicity
     integrity_input = {

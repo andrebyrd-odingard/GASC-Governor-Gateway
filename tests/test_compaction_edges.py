@@ -177,3 +177,27 @@ def test_designate_idempotency():
     
     # Ensure ledger didn't duplicate
     assert ledger_count_1 == ledger_count_2
+
+def test_covers_interval_gap_computation():
+    # Chain: node-1 -> node-2 -> node-3
+    p1 = create_payload("node-1", "clean-parent-1", {"data": "1"})
+    assert client.post("/submit-candidate", json=p1).status_code == 200
+    
+    p2 = create_payload("node-2", "node-1", {"data": "2"})
+    assert client.post("/submit-candidate", json=p2).status_code == 200
+    
+    p3 = create_payload("node-3", "node-2", {"data": "3"})
+    assert client.post("/submit-candidate", json=p3).status_code == 200
+    
+    # Compaction covering node-1 and node-3, omitting node-2
+    p4 = create_payload("compaction-gap", "node-3", {"data": "summary"}, is_compaction=True)
+    p4["covers"] = ["node-1", "node-3"]
+    assert client.post("/submit-candidate", json=p4).status_code == 200
+    
+    db_state = client.get("/db-state", headers={"Authorization": f"Bearer {generate_admin_token()}"}).json()
+    gap = db_state["dag"]["compaction-gap"]["covers_interval_gap"]
+    
+    # node-2 sits between node-1 and node-3 but was omitted from covers
+    assert "node-2" in gap
+    assert "node-1" not in gap
+    assert "node-3" not in gap
