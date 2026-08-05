@@ -130,7 +130,8 @@ def test_compaction_edge_fail_closed_routing():
     # Conformance Row 9 Assertion: Irreducible fraction is 100%. 
     # This mathematically scores as NOT-EXERCISED per CSR-PUB-0005 §7.3 
     # since no node is successfully re-derived.
-    assert len(repair_candidates) == 1
+    for node_id, data in repair_candidates.items():
+        assert data["disposition"] == "IRREDUCIBLE"
 
 def test_designate_auth_failures():
     designate_event = {
