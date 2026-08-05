@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GASC_QuarantineEvent",
+  "type": "object",
+  "required": [
+    "quarantine_event_id",
+    "detected_at_utc",
+    "poisoned_root_id",
+    "computed_blast_radius_C_p",
+    "independent_snapshot_hash",
+    "monotonic_ledger_digest_post_transition"
+  ],
+  "properties": {
+    "quarantine_event_id": { "type": "string", "format": "uuid" },
+    "detected_at_utc": { "type": "string", "format": "date-time" },
+    "poisoned_root_id": { "type": "string", "format": "uuid" },
+    "computed_blast_radius_C_p": {
+      "type": "array",
+      "items": { "type": "string", "format": "uuid" },
+      "minItems": 1,
+      "uniqueItems": true,
+      "description": "Must include poisoned_root_id and all downstream DAG descendants."
+    },
+    "independent_snapshot_hash": {
+      "type": "string",
+      "pattern": "^[a-fA-F0-9]{64}$",
+      "description": "SHA-256 hash of independent state snapshot used to compute blast radius (Rule 2)."
+    },
+    "monotonic_ledger_digest_post_transition": {
+      "type": "string",
+      "pattern": "^[a-fA-F0-9]{64}$",
+      "description": "Cryptographic proof enforcing historical monotonicity Q_t <= Q_{t+1}."
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GASC_GovernedReconstructionRequest",
+  "type": "object",
+  "required": [
+    "reconstruction_id",
+    "target_replaced_node_id",
+    "new_candidate_node_id",
+    "admissible_frontier_parent_ids",
+    "reconstruction_method",
+    "candidate_payload"
+  ],
+  "properties": {
+    "reconstruction_id": { "type": "string", "format": "uuid" },
+    "target_replaced_node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Quarantined record being functionally replaced. Node itself is NOT overwritten."
+    },
+    "new_candidate_node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "MUST NOT match target_replaced_node_id. Fresh identity enforced."
+    },
+    "admissible_frontier_parent_ids": {
+      "type": "array",
+      "items": { "type": "string", "format": "uuid" },
+      "minItems": 1,
+      "description": "Must consist strictly of clean, non-quarantined ancestors."
+    },
+    "reconstruction_method": {
+      "type": "string",
+      "enum": ["CHECKPOINT_REPLAY", "BOUNDED_SUBSTITUTE_GENERATION", "CLEAN_FRONTIER_DERIVATION"]
+    },
+    "candidate_payload": { "type": "object" }
+  },
+  "additionalProperties": false
+}
