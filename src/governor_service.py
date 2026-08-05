@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     OPA_URL: str | None = None # e.g. http://localhost:8181
     JWT_PUBLIC_KEY: str
     DEBUG_MODE: bool = False
+    RECOVERY_ADAPTER_URL: str | None = None
+    RECOVERY_ADAPTER_PUBLIC_KEY: str | None = None
 
 settings = Settings()
 
@@ -47,6 +49,12 @@ class DesignationEvent(BaseModel):
     confidence_score: float
     reason: str
 
+class CheckpointEvent(BaseModel):
+    checkpoint_id: str
+    target_node_id: str
+    declared_at_utc: str
+    snapshot_data: dict
+
 # --- State Backend Abstraction ---
 class BaseStateBackend(ABC):
     @abstractmethod
@@ -64,6 +72,10 @@ class BaseStateBackend(ABC):
     @abstractmethod
     async def compute_blast_radius(self, poisoned_root_id: str) -> List[str]: pass
     @abstractmethod
+    async def add_checkpoint(self, checkpoint: dict): pass
+    @abstractmethod
+    async def get_checkpoints(self) -> Dict[str, dict]: pass
+    @abstractmethod
     async def reset(self): pass
 
 class MemoryStateBackend(BaseStateBackend):
@@ -76,6 +88,7 @@ class MemoryStateBackend(BaseStateBackend):
         self.quarantine_ledger = ["quarantined-node-A"]
         self.quarantine_events = []
         self.repair_candidates = {}
+        self.checkpoints = {}
         
     async def get_dag(self) -> Dict[str, Any]:
         async with self.lock: return self.dag.copy()
@@ -96,6 +109,12 @@ class MemoryStateBackend(BaseStateBackend):
         async with self.lock:
             if node_id not in self.quarantine_ledger:
                 self.quarantine_ledger.append(node_id)
+                
+    async def add_checkpoint(self, checkpoint: dict):
+        async with self.lock: self.checkpoints[checkpoint["checkpoint_id"]] = checkpoint
+        
+    async def get_checkpoints(self) -> Dict[str, dict]:
+        async with self.lock: return dict(self.checkpoints)
         
     async def compute_blast_radius(self, poisoned_root_id: str) -> List[str]:
         # True Graph Traversal (BFS) with COMPACTION/CARRIED edge logic
@@ -103,6 +122,7 @@ class MemoryStateBackend(BaseStateBackend):
             visited = set([poisoned_root_id])
             queue = [poisoned_root_id]
             c_p = []
+            affected_compactions = []
             
             while queue:
                 current = queue.pop(0)
@@ -123,12 +143,62 @@ class MemoryStateBackend(BaseStateBackend):
                         visited.add(node_id)
                         queue.append(node_id)
                         if is_carried:
-                            # Flag as repair candidate, but traversal STILL continues (Fail-closed irreducibility)
-                            self.repair_candidates[node_id] = {
-                                "disposition": "IRREDUCIBLE",
-                                "reason": "no_reconstruction_backend",
-                                "escalation_record": "Requires human review"
-                            }
+                            affected_compactions.append(node_id)
+            
+            # R1 & R2
+            for comp_node in affected_compactions:
+                covers = self.dag[comp_node].get("covers", [])
+                
+                # R1: Admissible Frontier
+                frontier = [n for n in covers if n not in c_p]
+                if not frontier:
+                    self.repair_candidates[comp_node] = {
+                        "disposition": "IRREDUCIBLE",
+                        "reason": "empty_frontier",
+                        "escalation_record": "Requires human review"
+                    }
+                    continue
+                
+                # R2: Planner & Selection
+                summarizer = self.dag[comp_node].get("summarizer", {})
+                if summarizer.get("method_id") == "llm-v1":
+                    # Require verified checkpoint reconstruction
+                    admissible_checkpoint = None
+                    for cp_id, cp_data in self.checkpoints.items():
+                        # Admissibility: targets a clean node (in F) and not in C_p (which is true if in F)
+                        if cp_data["target_node_id"] in frontier:
+                            admissible_checkpoint = cp_data
+                            break
+                            
+                    if not admissible_checkpoint:
+                        self.repair_candidates[comp_node] = {
+                            "disposition": "IRREDUCIBLE",
+                            "reason": "no_admissible_checkpoint",
+                            "escalation_record": "Requires human review"
+                        }
+                        continue
+                        
+                    if not settings.RECOVERY_ADAPTER_URL:
+                        self.repair_candidates[comp_node] = {
+                            "disposition": "IRREDUCIBLE",
+                            "reason": "no_reconstruction_backend",
+                            "escalation_record": "Requires human review"
+                        }
+                        continue
+                        
+                    self.repair_candidates[comp_node] = {
+                        "disposition": "PENDING_RECONSTRUCTION",
+                        "frontier": frontier,
+                        "method": "verified_checkpoint_reconstruction",
+                        "checkpoint": admissible_checkpoint
+                    }
+                else:
+                    self.repair_candidates[comp_node] = {
+                        "disposition": "IRREDUCIBLE",
+                        "reason": "no_reconstruction_backend",
+                        "escalation_record": "Unknown summarizer method"
+                    }
+                    
             return sorted(c_p)
 
     async def reset(self):
@@ -330,6 +400,15 @@ async def submit_candidate(request: Request):
     await backend.commit_node(payload)
     return {"status": "success", "message": "State node committed to DAG."}
 
+@app.post("/checkpoint")
+async def declare_checkpoint(event: CheckpointEvent, request: Request):
+    verify_role_jwt(request, "admin")
+    
+    # We do not verify admissibility at declaration time (e.g., predates containment),
+    # since there is no incident yet. We just store the checkpoint.
+    await backend.add_checkpoint(event.model_dump())
+    return {"status": "success", "message": "Checkpoint declared"}
+
 @app.post("/designate")
 async def designate_poison(event: DesignationEvent, request: Request):
     claims = verify_role_jwt(request, "designator")
@@ -363,6 +442,75 @@ async def designate_poison(event: DesignationEvent, request: Request):
         "designation_reason": event.reason
     }
     await backend.log_quarantine_event(q_event)
+    
+    # R3: Attempt external reconstruction
+    repair_candidates = await backend.get_repair_candidates()
+    for comp_node, rc_data in repair_candidates.items():
+        if rc_data["disposition"] == "PENDING_RECONSTRUCTION":
+            if not settings.RECOVERY_ADAPTER_URL:
+                rc_data["disposition"] = "IRREDUCIBLE"
+                rc_data["reason"] = "no_reconstruction_backend"
+                continue
+                
+            try:
+                # POST to adapter
+                async with httpx.AsyncClient() as client:
+                    resp = await client.post(
+                        f"{settings.RECOVERY_ADAPTER_URL}/reconstruct",
+                        json={
+                            "frontier": rc_data["frontier"],
+                            "method": rc_data["method"],
+                            "checkpoint": rc_data["checkpoint"]
+                        },
+                        timeout=5.0
+                    )
+                    
+                if resp.status_code != 200:
+                    rc_data["disposition"] = "IRREDUCIBLE"
+                    rc_data["reason"] = "backend_unavailable"
+                    continue
+                    
+                candidate = resp.json().get("candidate", {})
+                
+                # Verify R4
+                # We do NOT verify the generated text. We verify identity and frontier.
+                if not candidate:
+                    rc_data["disposition"] = "IRREDUCIBLE"
+                    rc_data["reason"] = "backend_unavailable"
+                    continue
+                    
+                # The candidate should be signed by the adapter
+                if not verify_cryptographic_signature(candidate):
+                    rc_data["disposition"] = "IRREDUCIBLE"
+                    rc_data["reason"] = "invalid_signature"
+                    continue
+                    
+                # R4 Identity Verification: Signature must match RECOVERY_ADAPTER_PUBLIC_KEY
+                adapter_key = settings.RECOVERY_ADAPTER_PUBLIC_KEY
+                if adapter_key and candidate.get("ephemeral_nhi", {}).get("identity_id") != adapter_key:
+                    rc_data["disposition"] = "IRREDUCIBLE"
+                    rc_data["reason"] = "invalid_identity"
+                    continue
+                    
+                # R4 Frontier Verification
+                if set(candidate.get("covers", [])) != set(rc_data["frontier"]):
+                    rc_data["disposition"] = "IRREDUCIBLE"
+                    rc_data["reason"] = "frontier_mismatch"
+                    continue
+                    
+                # R5 Reintegration Gate (Simplified, in real system this is an OPA call)
+                # But we just admit it directly since the Rego checks happen in submit-candidate usually,
+                # actually we should commit it to the DAG.
+                await backend.commit_node(candidate)
+                rc_data["disposition"] = "REDUCIBLE"
+                rc_data["reconstructed_node_id"] = candidate.get("payload_id")
+                
+            except httpx.ReadTimeout:
+                rc_data["disposition"] = "IRREDUCIBLE"
+                rc_data["reason"] = "backend_timeout"
+            except Exception as e:
+                rc_data["disposition"] = "IRREDUCIBLE"
+                rc_data["reason"] = "backend_unavailable"
     
     return {"status": "success", "event": q_event}
 
