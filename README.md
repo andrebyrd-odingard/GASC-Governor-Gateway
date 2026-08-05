@@ -4,7 +4,7 @@
 
 The **GASC-Governor-Gateway** is a lightweight, fail-closed policy enforcement sidecar that isolates AI agents and prevents cascading failures via Transitive Taint Propagation.
 
-It implements the [GASC-ED v1.1 Engineering Architecture & Policy-as-Code Specification](https://ssrn.com/abstract=6976282) and enforces rules based on the **Containment Survivability Research (CSR) Program** (specifically CSR-PUB-0005).
+It implements the **GASC-ED v1.1 Engineering Architecture & Policy-as-Code Specification** and enforces rules based on the **Containment Survivability Research (CSR) Program** (specifically CSR-PUB-0005).
 
 ## 🔬 About the CSR Program
 
