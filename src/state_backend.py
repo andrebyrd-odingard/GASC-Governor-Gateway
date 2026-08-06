@@ -39,9 +39,18 @@ class BaseStateBackend(ABC):
     @abstractmethod
     async def get_calibration_runs(self) -> List[dict]: pass
     
+
+    @abstractmethod
+    async def record_shadow_decision(self, decision_id: str, node_id: str, evaluated_at_utc: str, would_have_blocked: bool, reason: str, parent_status_json: str, policy_bundle_digest: str, writer_identity: str):
+        pass
+
     @abstractmethod
     async def nodes_exist(self, node_ids: List[str]) -> Dict[str, bool]: pass
     @abstractmethod
     async def are_quarantined(self, node_ids: List[str]) -> Dict[str, bool]: pass
     @abstractmethod
     async def compute_covers_interval_gap(self, covers: List[str]) -> List[str]: pass
+    @abstractmethod
+    async def compute_quarantine_digest(self, additional_node_ids: List[str]) -> str:
+        """Compute SHA-256 of sorted(current_ledger + additional_node_ids) without returning the full ledger."""
+        pass

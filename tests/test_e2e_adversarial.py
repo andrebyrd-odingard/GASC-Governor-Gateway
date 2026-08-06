@@ -111,6 +111,7 @@ def test_e2e_adversarial_injection_via_designate():
     db_state = client.get("/db-state", headers={"Authorization": f"Bearer {generate_admin_token()}"}).json()
     
     audit_manifest = {
+        "enforcement_mode": db_state.get("enforcement_mode", "enforce"),
         "boundary_id": "BOUNDARY-TEST",
         "operating_envelope_declaration": "E2E Test Envelope",
         "admitted_writes": list(db_state.get("dag", {}).values()),

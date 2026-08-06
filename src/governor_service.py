@@ -10,12 +10,22 @@ import uuid
 import hashlib
 import httpx
 import jwt
+import os
+import json
 from ecdsa import VerifyingKey, NIST256p
 from pydantic_settings import BaseSettings
 from typing import Dict, List, Any
 from abc import ABC, abstractmethod
 from pydantic import BaseModel
 from enum import Enum
+import subprocess
+import asyncio
+
+try:
+    import wasmtime
+    from src.wasm_engine import OpaWasmEngine
+except ImportError:
+    wasmtime = None
 
 # --- Settings ---
 from src.config import settings
@@ -130,6 +140,7 @@ class MemoryStateBackend(BaseStateBackend):
         self.repair_candidates = {}
         self.checkpoints = {}
         self.external_effects = {}
+        self.shadow_decisions = []
         
     async def get_dag(self) -> Dict[str, Any]:
         async with self.lock: return self.dag.copy()
@@ -299,6 +310,12 @@ class MemoryStateBackend(BaseStateBackend):
     async def get_withdrawal_ledger(self) -> Dict[str, dict]: return {}
     async def record_calibration_run(self, run: dict): pass
     async def get_calibration_runs(self) -> List[dict]: return []
+    
+    async def record_shadow_decision(self, decision_id: str, node_id: str, evaluated_at_utc: str, would_have_blocked: bool, reason: str, parent_status_json: str, policy_bundle_digest: str, writer_identity: str):
+        async with self.lock:
+            self.shadow_decisions.append({"would_have_blocked": would_have_blocked})
+
+
 
     async def nodes_exist(self, node_ids: List[str]) -> Dict[str, bool]:
         async with self.lock:
@@ -313,6 +330,10 @@ class MemoryStateBackend(BaseStateBackend):
         async with self.lock:
             return _compute_covers_interval_gap(self.dag, covers)
 
+    async def compute_quarantine_digest(self, additional_node_ids: List[str]) -> str:
+        async with self.lock:
+            merged = sorted(set(self.quarantine_ledger) | set(additional_node_ids))
+            return hashlib.sha256(json.dumps(merged, sort_keys=True).encode()).hexdigest()
 
 
 if settings.BACKEND_TYPE == "sqlite":
@@ -327,6 +348,14 @@ app = FastAPI()
 async def startup_event():
     if hasattr(backend, "init_db"):
         await backend.init_db()
+        
+    if settings.ENFORCEMENT_MODE == "shadow":
+        if settings.SHADOW_BANNER:
+            print("===========================================================")
+            print("WARNING: GASC GOVERNOR IS RUNNING IN SHADOW MODE")
+            print("Writes that fail policy checks WILL BE ADMITTED.")
+            print("Decisions are recorded in shadow_decisions for auditing.")
+            print("===========================================================")
 
 
 # --- Security Checks ---
@@ -372,8 +401,42 @@ def verify_cryptographic_signature(payload: dict) -> bool:
     except Exception as e:
         return False
 
+_wasm_engine_cache = {}
+
 async def evaluate_opa_policy(policy_package: str, query: str, input_data: dict) -> bool:
+    if settings.OPA_POLICY_BUNDLE and os.path.exists(settings.OPA_POLICY_BUNDLE):
+        try:
+            if wasmtime and settings.OPA_POLICY_BUNDLE.endswith(".wasm"):
+                if settings.OPA_POLICY_BUNDLE not in _wasm_engine_cache:
+                    _wasm_engine_cache[settings.OPA_POLICY_BUNDLE] = OpaWasmEngine(settings.OPA_POLICY_BUNDLE)
+                engine = _wasm_engine_cache[settings.OPA_POLICY_BUNDLE]
+                
+                # Note: evaluation should ideally happen in a thread pool for true async or fast enough sync
+                # But for benchmarking we just use it directly
+
+                result = engine.evaluate(input_data, query)
+                
+                # Check specific entrypoints since we exported multiple
+                res = result[0].get("result", False)
+                if isinstance(res, bool): return res
+                if "allow_state_write" in res: return res["allow_state_write"]
+                if "allow_reintegration" in res: return res["allow_reintegration"]
+                return False
+                
+            cmd = [str(OPA_BIN), "eval", "-b", settings.OPA_POLICY_BUNDLE, "--stdin-input", query]
+            process = await asyncio.create_subprocess_exec(
+                *cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate(input=json.dumps(input_data).encode())
+            if process.returncode == 0:
+                output = json.loads(stdout.decode())
+                return output.get("result", [{}])[0].get("expressions", [{}])[0].get("value", False)
+        except Exception as e:
+            print('WASM ERROR:', e)
+            pass
+
     if settings.OPA_URL:
+
         try:
             async with httpx.AsyncClient() as client:
                 res = await client.post(f"{settings.OPA_URL}/v1/data/{policy_package}", json={"input": input_data})
@@ -430,38 +493,8 @@ def _compute_covers_interval_gap(dag, covers):
     return sorted(list(interval - covers_set))
 
 # --- Routes ---
-@app.post("/submit-candidate")
-async def submit_candidate(request: Request):
-    try:
-        payload = await request.json()
-    except:
-        raise HTTPException(status_code=400, detail="Invalid JSON format")
-        
-    try:
-        validate(instance=payload, schema=PAYLOAD_SCHEMA)
-    except jsonschema.exceptions.ValidationError as e:
-        print(f"Schema validation failed: {e.message}"); raise HTTPException(status_code=400, detail=f"Schema validation failed: {e.message}")
-        
-    token = payload.get("ephemeral_nhi", {}).get("session_token")
-    identity_id = payload.get("ephemeral_nhi", {}).get("identity_id")
-    auth_context = verify_nhi_jwt(token, identity_id)
-    
-    if not verify_cryptographic_signature(payload):
-        raise HTTPException(status_code=401, detail="Cryptographic signature verification failed")
 
-    import asyncio
-    parent_ids = [p["parent_node_id"] for p in payload.get("parent_dependency_commitments", [])]
-    if len(parent_ids) > 256: # settings.MAX_DECLARED_PARENTS
-        raise HTTPException(status_code=400, detail="Too many declared parents")
-
-    exists_map, quarantined_map = await asyncio.gather(
-        backend.nodes_exist(parent_ids),
-        backend.are_quarantined(parent_ids),
-    )
-
-    if payload.get("node_type") == "COMPACTION":
-        payload["covers_interval_gap"] = await backend.compute_covers_interval_gap(payload.get("covers", []))
-
+async def evaluate_admission(payload: dict, parent_ids: List[str], exists_map: Dict[str, bool], quarantined_map: Dict[str, bool], auth_context: dict) -> dict:
     integrity_input = {
         "write_request": payload,
         "parent_status": [
@@ -483,40 +516,14 @@ async def submit_candidate(request: Request):
     if not is_integrity_valid:
         tainted = [pid for pid in parent_ids if quarantined_map.get(pid)]
         if tainted:
-            poisoned_root = tainted[0]
-            
-            await backend.commit_node(payload) 
-            c_p = await backend.compute_blast_radius(poisoned_root)
-            
-            from src.r6_utils import process_recurrence
-            active_horizons = await backend.get_active_horizon_set()
-            for n in c_p:
-                if n in active_horizons:
-                    await process_recurrence(backend, n, "PROHIBITED_PATH", "internal_hook")
-            
-            dag_state = await backend.get_dag()
-            q_ledger = await backend.get_quarantine_ledger()
-            updated_ledger = q_ledger + [payload.get("payload_id")]
-            monotonic_ledger_digest = hashlib.sha256(json.dumps(updated_ledger, sort_keys=True).encode()).hexdigest()
-            
-            event = {
-                "quarantine_event_id": str(uuid.uuid4()),
-                "detected_at_utc": datetime.now(timezone.utc).isoformat() + "Z",
-                "poisoned_root_id": poisoned_root,
-                "computed_blast_radius_C_p": c_p,
-                "monotonic_ledger_digest_post_transition": monotonic_ledger_digest
-            }
-            await backend.apply_quarantine_transaction(event, [payload.get("payload_id")])
-            raise HTTPException(status_code=403, detail={"error": "TAINTED_PARENT", "event": event})
-            
-        raise HTTPException(status_code=400, detail="Lineage or Monotonicity Invalid")
+            return {"admit": False, "reason": "TAINTED_PARENT", "poisoned_root": tainted[0]}
+        return {"admit": False, "reason": "Lineage or Monotonicity Invalid"}
 
-    # 2. Reintegration Check
     reintegration_input = {
         "candidate_submission": {
             "new_candidate_node_id": payload.get("payload_id"),
             "target_replaced_node_id": "none",
-            "admissible_frontier_parent_ids": [p["parent_node_id"] for p in payload.get("parent_dependency_commitments", [])],
+            "admissible_frontier_parent_ids": parent_ids,
         },
         "quarantine_set_Q": [pid for pid in parent_ids if quarantined_map.get(pid)],
         "auth_context": auth_context,
@@ -534,12 +541,121 @@ async def submit_candidate(request: Request):
     )
     
     if not is_reintegration_valid:
-        raise HTTPException(status_code=403, detail="Verification Separation Policy Failed")
+        return {"admit": False, "reason": "Verification Separation Policy Failed"}
 
-    await backend.commit_node(payload)
-    return {"status": "success", "message": "State node committed to DAG."}
+    return {"admit": True}
+
+@app.post("/submit-candidate")
+async def submit_candidate(request: Request):
+
+    try:
+        payload = await request.json()
+    except:
+        raise HTTPException(status_code=400, detail="Invalid JSON format")
+        
+    try:
+        validate(instance=payload, schema=PAYLOAD_SCHEMA)
+    except jsonschema.exceptions.ValidationError as e:
+        raise HTTPException(status_code=400, detail=f"Schema validation failed: {e.message}")
+        
+    token = payload.get("ephemeral_nhi", {}).get("session_token")
+    identity_id = payload.get("ephemeral_nhi", {}).get("identity_id")
+    auth_context = verify_nhi_jwt(token, identity_id)
+    
+    if not verify_cryptographic_signature(payload):
+        raise HTTPException(status_code=401, detail="Cryptographic signature verification failed")
+
+    parent_ids = [p["parent_node_id"] for p in payload.get("parent_dependency_commitments", [])]
+    if len(parent_ids) > 256:
+        raise HTTPException(status_code=400, detail="Too many declared parents")
+
+    exists_map, quarantined_map = await asyncio.gather(
+        backend.nodes_exist(parent_ids),
+        backend.are_quarantined(parent_ids),
+    )
+
+    if payload.get("node_type") == "COMPACTION":
+        payload["covers_interval_gap"] = await backend.compute_covers_interval_gap(payload.get("covers", []))
+
+    decision = await evaluate_admission(payload, parent_ids, exists_map, quarantined_map, auth_context)
+    
+    decision_id = str(uuid.uuid4())
+    writer_identity = auth_context.get("sub", "unknown")
+    parent_status_json = json.dumps([{"parent_node_id": pid, "exists": exists_map.get(pid, False), "quarantined": quarantined_map.get(pid, False)} for pid in parent_ids])
+    
+    if settings.ENFORCEMENT_MODE == "shadow":
+        await backend.record_shadow_decision(
+            decision_id=decision_id,
+            node_id=payload.get("payload_id"),
+            evaluated_at_utc=datetime.now(timezone.utc).isoformat() + "Z",
+            would_have_blocked=not decision["admit"],
+            reason=decision.get("reason", ""),
+            parent_status_json=parent_status_json,
+            policy_bundle_digest=settings.OPA_POLICY_BUNDLE or "none",
+            writer_identity=writer_identity
+        )
+        # Shadow mode: always admit unless invalid signature/schema (which we already threw for)
+        await backend.commit_node(payload)
+        return {"status": "success", "message": "State node committed to DAG (Shadow Mode)."}
+    else:
+        if not decision["admit"]:
+            await backend.record_shadow_decision(
+                decision_id=decision_id,
+                node_id=payload.get("payload_id"),
+                evaluated_at_utc=datetime.now(timezone.utc).isoformat() + "Z",
+                would_have_blocked=True,
+                reason=decision.get("reason", ""),
+                parent_status_json=parent_status_json,
+                policy_bundle_digest=settings.OPA_POLICY_BUNDLE or "none",
+                writer_identity=writer_identity
+            )
+            
+            if decision.get("reason") == "TAINTED_PARENT":
+                poisoned_root = decision["poisoned_root"]
+                # Deliberate: commit the rejected payload so it appears in the
+                # blast-radius BFS and the quarantine ledger for audit
+                # completeness.  The node is refused (403) but its attempt is
+                # permanently recorded — the same way a firewall logs dropped
+                # packets.
+                await backend.commit_node(payload)
+                c_p = await backend.compute_blast_radius(poisoned_root)
+                
+                from src.r6_utils import process_recurrence
+                active_horizons = await backend.get_active_horizon_set()
+                for n in c_p:
+                    if n in active_horizons:
+                        await process_recurrence(backend, n, "PROHIBITED_PATH", "internal_hook")
+                
+                new_quarantined = [payload.get("payload_id")]
+                monotonic_ledger_digest = await backend.compute_quarantine_digest(c_p + new_quarantined)
+                
+                event = {
+                    "quarantine_event_id": str(uuid.uuid4()),
+                    "detected_at_utc": datetime.now(timezone.utc).isoformat() + "Z",
+                    "poisoned_root_id": poisoned_root,
+                    "computed_blast_radius_C_p": c_p,
+                    "monotonic_ledger_digest_post_transition": monotonic_ledger_digest
+                }
+                await backend.apply_quarantine_transaction(event, new_quarantined)
+                raise HTTPException(status_code=403, detail={"error": "TAINTED_PARENT", "event": event})
+            else:
+                raise HTTPException(status_code=403 if decision.get("reason") == "Verification Separation Policy Failed" else 400, detail=decision.get("reason", "Policy Failed"))
+                
+        await backend.record_shadow_decision(
+            decision_id=decision_id,
+            node_id=payload.get("payload_id"),
+            evaluated_at_utc=datetime.now(timezone.utc).isoformat() + "Z",
+            would_have_blocked=False,
+            reason="",
+            parent_status_json=parent_status_json,
+            policy_bundle_digest=settings.OPA_POLICY_BUNDLE or "none",
+            writer_identity=writer_identity
+        )
+        await backend.commit_node(payload)
+        return {"status": "success", "message": "State node committed to DAG."}
 
 @app.post("/declare-external-effect")
+
 async def declare_external_effect(event: ExternalEffectEvent, request: Request):
     """
     Records an external effect (e.g. API call, payment) to prevent semantic rollbacks.
@@ -615,12 +731,13 @@ async def declare_checkpoint(event: CheckpointEvent, request: Request):
 async def designate_poison(event: DesignationEvent, request: Request):
     claims = verify_role_jwt(request, "designator")
     
-    dag = await backend.get_dag()
-    if event.poisoned_node_id not in dag:
+    exists_map, quarantined_map = await asyncio.gather(
+        backend.nodes_exist([event.poisoned_node_id]),
+        backend.are_quarantined([event.poisoned_node_id]),
+    )
+    if not exists_map.get(event.poisoned_node_id):
         raise HTTPException(status_code=404, detail="Node ID not found in DAG")
-        
-    q_ledger = await backend.get_quarantine_ledger()
-    if event.poisoned_node_id in q_ledger:
+    if quarantined_map.get(event.poisoned_node_id):
         return {"status": "ok", "message": "Node already in quarantine ledger"}
         
     c_p = await backend.compute_blast_radius(event.poisoned_node_id)
@@ -631,9 +748,7 @@ async def designate_poison(event: DesignationEvent, request: Request):
         if n in active_horizons:
             await process_recurrence(backend, n, "RENEWED_DESIGNATION", "internal_hook")
     
-    # Calculate what the ledger digest will be
-    updated_ledger = list(set(q_ledger + c_p))
-    monotonic_ledger_digest = hashlib.sha256(json.dumps(updated_ledger, sort_keys=True).encode()).hexdigest()
+    monotonic_ledger_digest = await backend.compute_quarantine_digest(c_p)
     
     q_event = {
         "quarantine_event_id": str(uuid.uuid4()),
@@ -648,6 +763,9 @@ async def designate_poison(event: DesignationEvent, request: Request):
     
     # R3: Attempt external reconstruction
     repair_candidates = await backend.get_repair_candidates()
+    # Defer expensive loads until we know reconstruction is actually needed
+    _dag_cache = None
+    _q_ledger_cache = None
     for comp_node, rc_data in repair_candidates.items():
         if rc_data["disposition"] == "PENDING_RECONSTRUCTION":
             if not settings.RECOVERY_ADAPTER_URL:
@@ -657,12 +775,19 @@ async def designate_poison(event: DesignationEvent, request: Request):
                 continue
                 
             try:
+                # Lazy-load DAG and quarantine ledger only when reconstruction fires
+                if _dag_cache is None:
+                    _dag_cache, _q_ledger_cache = await asyncio.gather(
+                        backend.get_dag(),
+                        backend.get_quarantine_ledger(),
+                    )
+                
                 # POST to adapter
-                compaction_covers = dag[comp_node].get("covers", [])
+                compaction_covers = _dag_cache[comp_node].get("covers", [])
                 
                 # Structural projection: strip state_content
                 dag_projection = {}
-                for n_id, n_data in dag.items():
+                for n_id, n_data in _dag_cache.items():
                     dag_projection[n_id] = {k: v for k, v in n_data.items() if k != "state_content"}
 
                 async with httpx.AsyncClient() as client:
@@ -670,7 +795,7 @@ async def designate_poison(event: DesignationEvent, request: Request):
                         f"{settings.RECOVERY_ADAPTER_URL}/reconstruct",
                         json={
                             "graph_snapshot": dag_projection,
-                            "quarantine_ledger": q_ledger,
+                            "quarantine_ledger": _q_ledger_cache,
                             "poisoned_root_id": event.poisoned_node_id,
                             "compaction_covers": compaction_covers,
                             "requested_frontier": rc_data["frontier"],
@@ -794,6 +919,28 @@ async def get_recurrence_report(request: Request):
         "withdrawal_ledger": await backend.get_withdrawal_ledger()
     }
 
+@app.get("/shadow-report")
+async def get_shadow_report(request: Request):
+    verify_role_jwt(request, "admin")
+    
+    if hasattr(backend, "_connect"):
+        async with backend._connect() as db:
+            async with db.execute("SELECT COUNT(*) FROM shadow_decisions") as cursor:
+                total = (await cursor.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM shadow_decisions WHERE would_have_blocked = 1") as cursor:
+                blocked = (await cursor.fetchone())[0]
+    else:
+        total = len(backend.shadow_decisions)
+        blocked = sum(1 for d in backend.shadow_decisions if d["would_have_blocked"])
+
+        
+    return {
+        "enforcement_mode": settings.ENFORCEMENT_MODE,
+        "total_decisions": total,
+        "counterfactual_rejections": blocked,
+        "caveat": "Shadow-mode blast radii are upper bounds relative to enforcement mode because they include writes that would have been blocked."
+    }
+
 @app.get("/db-state")
 async def get_db_state(request: Request):
     verify_role_jwt(request, "admin")
@@ -803,7 +950,8 @@ async def get_db_state(request: Request):
         "dag": await backend.get_dag(),
         "quarantine_ledger": await backend.get_quarantine_ledger(),
         "quarantine_events": await backend.get_quarantine_events(),
-        "repair_candidates": await backend.get_repair_candidates()
+        "repair_candidates": await backend.get_repair_candidates(),
+        "enforcement_mode": settings.ENFORCEMENT_MODE
     }
 
 @app.post("/reset-db")
@@ -852,3 +1000,14 @@ async def get_reducibility_report(request: Request):
             "fraction": undecided_count / total if total > 0 else 0.0
         }
     }
+
+@app.get("/readyz")
+async def readyz():
+    if settings.OPA_POLICY_BUNDLE and not os.path.exists(settings.OPA_POLICY_BUNDLE):
+        raise HTTPException(status_code=503, detail="Policy bundle not found")
+    return {"status": "ok", "enforcement_mode": settings.ENFORCEMENT_MODE}
+
+@app.get("/livez")
+async def livez():
+    return {"status": "ok"}
+    

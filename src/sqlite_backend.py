@@ -3,6 +3,7 @@ import json
 import hashlib
 import os
 from typing import Dict, Any, List
+from contextlib import asynccontextmanager
 
 from src.governor_service import BaseStateBackend
 from src.config import settings
@@ -10,12 +11,19 @@ from src.config import settings
 class SqliteStateBackend(BaseStateBackend):
     def __init__(self, db_path: str = "state.db"):
         self.db_path = db_path
+        self._db = None
         self._max_traversal_depth = getattr(settings, "MAX_TRAVERSAL_DEPTH", 1000)
 
+    @asynccontextmanager
+    async def _connect(self):
+        if self._db is None:
+            self._db = await aiosqlite.connect(self.db_path)
+            await self._db.execute("PRAGMA journal_mode=WAL")
+            await self._db.execute("PRAGMA synchronous=FULL")
+        yield self._db
+
     async def init_db(self):
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("PRAGMA journal_mode=WAL")
-            await db.execute("PRAGMA synchronous=FULL")
+        async with self._connect() as db:
             
             await db.execute('''CREATE TABLE IF NOT EXISTS nodes (
                 node_id TEXT PRIMARY KEY,
@@ -94,28 +102,42 @@ class SqliteStateBackend(BaseStateBackend):
                 monitored_period_json TEXT NOT NULL
             )''')
             
+            await db.execute('''CREATE TABLE IF NOT EXISTS shadow_decisions (
+                decision_id       TEXT PRIMARY KEY,
+                node_id           TEXT NOT NULL,
+                evaluated_at_utc  TEXT NOT NULL,
+                would_have_blocked INTEGER NOT NULL,
+                reason            TEXT,
+                parent_status_json TEXT NOT NULL,
+                policy_bundle_digest TEXT NOT NULL,
+                writer_identity   TEXT
+            )''')
+            
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_shadow_evaluated ON shadow_decisions(evaluated_at_utc)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_shadow_blocked ON shadow_decisions(would_have_blocked)")
+            
             await db.commit()
 
     async def get_dag(self) -> Dict[str, Any]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute("SELECT node_id, payload_json FROM nodes") as cursor:
                 rows = await cursor.fetchall()
                 return {row[0]: json.loads(row[1]) for row in rows}
 
     async def get_quarantine_ledger(self) -> List[str]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute("SELECT node_id FROM quarantine_ledger") as cursor:
                 rows = await cursor.fetchall()
                 return [row[0] for row in rows]
 
     async def get_repair_candidates(self) -> Dict[str, Any]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute("SELECT node_id, candidate_json FROM repair_candidates") as cursor:
                 rows = await cursor.fetchall()
                 return {row[0]: json.loads(row[1]) for row in rows}
                 
     async def update_repair_candidate(self, node_id: str, data: dict):
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await self._set_repair_candidate(db, node_id, data)
 
     async def commit_node(self, payload: dict):
@@ -130,7 +152,7 @@ class SqliteStateBackend(BaseStateBackend):
         
         payload_json = json.dumps(payload)
         
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             # We want to replace if exists to allow overwriting in tests or reintegration
             await db.execute(
                 "INSERT OR REPLACE INTO nodes (node_id, payload_json, content_hash, commitment) VALUES (?, ?, ?, ?)",
@@ -148,7 +170,7 @@ class SqliteStateBackend(BaseStateBackend):
 
     async def log_quarantine_event(self, event: dict):
         # Fallback method, ideally use apply_quarantine_transaction
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "INSERT OR REPLACE INTO quarantine_events (event_id, event_json) VALUES (?, ?)",
                 (event["quarantine_event_id"], json.dumps(event))
@@ -157,7 +179,7 @@ class SqliteStateBackend(BaseStateBackend):
 
     async def add_to_quarantine_ledger(self, node_id: str):
         # Fallback method, ideally use apply_quarantine_transaction
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute("INSERT OR IGNORE INTO quarantine_ledger (node_id) VALUES (?)", (node_id,))
             await db.commit()
 
@@ -169,7 +191,7 @@ class SqliteStateBackend(BaseStateBackend):
         # Record the traversal depth lever in the event
         event["max_traversal_depth"] = self._max_traversal_depth
         
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "INSERT OR REPLACE INTO quarantine_events (event_id, event_json) VALUES (?, ?)",
                 (event["quarantine_event_id"], json.dumps(event))
@@ -179,7 +201,7 @@ class SqliteStateBackend(BaseStateBackend):
             await db.commit()
 
     async def get_quarantine_events(self) -> List[dict]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute("SELECT event_json FROM quarantine_events") as cursor:
                 rows = await cursor.fetchall()
                 return [json.loads(row[0]) for row in rows]
@@ -202,7 +224,7 @@ class SqliteStateBackend(BaseStateBackend):
         )
         SELECT DISTINCT node_id FROM blast_radius;
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(query, (poisoned_root_id, self._max_traversal_depth)) as cursor:
                 rows = await cursor.fetchall()
                 c_p = sorted([row[0] for row in rows])
@@ -295,7 +317,7 @@ class SqliteStateBackend(BaseStateBackend):
         await db.commit()
 
     async def add_checkpoint(self, checkpoint: dict):
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "INSERT OR REPLACE INTO checkpoints (checkpoint_id, checkpoint_json) VALUES (?, ?)",
                 (checkpoint["checkpoint_id"], json.dumps(checkpoint))
@@ -303,14 +325,14 @@ class SqliteStateBackend(BaseStateBackend):
             await db.commit()
 
     async def get_checkpoints(self) -> Dict[str, dict]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute("SELECT checkpoint_id, checkpoint_json FROM checkpoints") as cursor:
                 rows = await cursor.fetchall()
                 return {row[0]: json.loads(row[1]) for row in rows}
 
     async def add_external_effect(self, idempotency_key: str, node_id: str, effect_type: str):
         from datetime import datetime, timezone
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "INSERT OR REPLACE INTO external_effects (idempotency_key, node_id, effect_type, recorded_at_utc) VALUES (?, ?, ?, ?)",
                 (idempotency_key, node_id, effect_type, datetime.now(timezone.utc).isoformat() + "Z")
@@ -318,7 +340,7 @@ class SqliteStateBackend(BaseStateBackend):
             await db.commit()
 
     async def check_external_effect(self, idempotency_key: str) -> bool:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute("SELECT 1 FROM external_effects WHERE idempotency_key = ?", (idempotency_key,)) as cursor:
                 row = await cursor.fetchone()
                 return row is not None
@@ -327,13 +349,13 @@ class SqliteStateBackend(BaseStateBackend):
         if not node_ids:
             return False
         placeholders = ",".join(["?"] * len(node_ids))
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(f"SELECT 1 FROM external_effects WHERE node_id IN ({placeholders}) LIMIT 1", tuple(node_ids)) as cursor:
                 row = await cursor.fetchone()
                 return row is not None
 
     async def reset(self):
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute("DELETE FROM nodes")
             await db.execute("DELETE FROM edges")
             await db.execute("DELETE FROM quarantine_ledger")
@@ -349,7 +371,7 @@ class SqliteStateBackend(BaseStateBackend):
             
         # Re-initialize basic data
         await self.commit_node({"payload_id": "clean-parent-1", "parent_dependency_commitments": []})
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute("INSERT OR IGNORE INTO quarantine_ledger (node_id) VALUES (?)", ("quarantined-node-A",))
             await db.commit()
 
@@ -357,7 +379,7 @@ class SqliteStateBackend(BaseStateBackend):
         from datetime import datetime, timezone, timedelta
         now = datetime.now(timezone.utc)
         expires = now + timedelta(seconds=horizon_seconds)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "INSERT OR REPLACE INTO reintegration_horizon (node_id, admitted_at_utc, trust_expires_utc, predecessor_id) VALUES (?, ?, ?, ?)",
                 (node_id, now.isoformat() + "Z", expires.isoformat() + "Z", predecessor_id)
@@ -367,7 +389,7 @@ class SqliteStateBackend(BaseStateBackend):
     async def get_active_horizon_set(self) -> Dict[str, dict]:
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat() + "Z"
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute("SELECT node_id, trust_expires_utc, predecessor_id, renewal_count FROM reintegration_horizon WHERE trust_expires_utc > ?", (now,)) as cursor:
                 rows = await cursor.fetchall()
                 return {r[0]: {"trust_expires_utc": r[1], "predecessor_id": r[2], "renewal_count": r[3]} for r in rows}
@@ -375,7 +397,7 @@ class SqliteStateBackend(BaseStateBackend):
     async def get_expired_horizon_set(self) -> List[str]:
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat() + "Z"
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute("SELECT node_id FROM reintegration_horizon WHERE trust_expires_utc <= ?", (now,)) as cursor:
                 rows = await cursor.fetchall()
                 return [r[0] for r in rows]
@@ -384,7 +406,7 @@ class SqliteStateBackend(BaseStateBackend):
         from datetime import datetime, timezone, timedelta
         now = datetime.now(timezone.utc)
         expires = now + timedelta(seconds=horizon_seconds)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "UPDATE reintegration_horizon SET trust_expires_utc = ?, renewal_count = renewal_count + 1 WHERE node_id = ?",
                 (expires.isoformat() + "Z", node_id)
@@ -394,7 +416,7 @@ class SqliteStateBackend(BaseStateBackend):
     async def apply_withdrawal_transaction(self, event: dict, w_r: List[str]):
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat() + "Z"
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "INSERT OR REPLACE INTO recurrence_events (event_id, node_id, recurrence_class, detected_at_utc, signal_source, event_json) VALUES (?, ?, ?, ?, ?, ?)",
                 (event["event_id"], event["node_id"], event["recurrence_class"], event["detected_at_utc"], event["signal_source"], json.dumps(event))
@@ -408,13 +430,13 @@ class SqliteStateBackend(BaseStateBackend):
             await db.commit()
 
     async def get_withdrawal_ledger(self) -> Dict[str, dict]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute("SELECT node_id, withdrawn_at_utc, triggering_event_id, withdrawal_reason FROM withdrawal_ledger") as cursor:
                 rows = await cursor.fetchall()
                 return {r[0]: {"withdrawn_at_utc": r[1], "triggering_event_id": r[2], "withdrawal_reason": r[3]} for r in rows}
 
     async def record_calibration_run(self, run: dict):
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "INSERT OR REPLACE INTO calibration_runs (run_id, run_at_utc, seeded_count, detected_count, sensitivity_floor, monitored_period_json) VALUES (?, ?, ?, ?, ?, ?)",
                 (run["run_id"], run["run_at_utc"], run["seeded_count"], run["detected_count"], run["sensitivity_floor"], json.dumps(run["monitored_period"]))
@@ -422,11 +444,20 @@ class SqliteStateBackend(BaseStateBackend):
             await db.commit()
 
     async def get_calibration_runs(self) -> List[dict]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute("SELECT run_id, run_at_utc, seeded_count, detected_count, sensitivity_floor, monitored_period_json FROM calibration_runs") as cursor:
                 rows = await cursor.fetchall()
                 return [{"run_id": r[0], "run_at_utc": r[1], "seeded_count": r[2], "detected_count": r[3], "sensitivity_floor": r[4], "monitored_period": json.loads(r[5])} for r in rows]
 
+
+
+    async def record_shadow_decision(self, decision_id: str, node_id: str, evaluated_at_utc: str, would_have_blocked: bool, reason: str, parent_status_json: str, policy_bundle_digest: str, writer_identity: str):
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO shadow_decisions (decision_id, node_id, evaluated_at_utc, would_have_blocked, reason, parent_status_json, policy_bundle_digest, writer_identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (decision_id, node_id, evaluated_at_utc, 1 if would_have_blocked else 0, reason, parent_status_json, policy_bundle_digest, writer_identity)
+            )
+            await db.commit()
 
     async def nodes_exist(self, node_ids: List[str]) -> Dict[str, bool]:
         if not node_ids:
@@ -434,7 +465,7 @@ class SqliteStateBackend(BaseStateBackend):
         uniq = list(dict.fromkeys(node_ids))
         q = f"SELECT node_id FROM nodes WHERE node_id IN ({','.join('?' * len(uniq))})"
         import aiosqlite
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(q, uniq) as cur:
                 found = {r[0] for r in await cur.fetchall()}
         return {nid: (nid in found) for nid in uniq}
@@ -445,10 +476,18 @@ class SqliteStateBackend(BaseStateBackend):
         uniq = list(dict.fromkeys(node_ids))
         q = f"SELECT node_id FROM quarantine_ledger WHERE node_id IN ({','.join('?' * len(uniq))})"
         import aiosqlite
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(q, uniq) as cur:
                 found = {r[0] for r in await cur.fetchall()}
         return {nid: (nid in found) for nid in uniq}
+
+    async def compute_quarantine_digest(self, additional_node_ids: List[str]) -> str:
+        async with self._connect() as db:
+            async with db.execute("SELECT node_id FROM quarantine_ledger") as cursor:
+                rows = await cursor.fetchall()
+                existing = {row[0] for row in rows}
+            merged = sorted(existing | set(additional_node_ids))
+            return hashlib.sha256(json.dumps(merged, sort_keys=True).encode()).hexdigest()
 
     async def compute_covers_interval_gap(self, covers: List[str]) -> List[str]:
         if not covers: return []
@@ -476,7 +515,7 @@ class SqliteStateBackend(BaseStateBackend):
         """
         params = tuple(uniq) * 3
         import aiosqlite
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(query, params) as cursor:
                 rows = await cursor.fetchall()
                 return sorted([r[0] for r in rows])

@@ -50,3 +50,6 @@ def backend_setup(request, monkeypatch, tmp_path):
             asyncio.run(test_backend.init_db())
             
     import src.governor_service; monkeypatch.setattr(src.governor_service, "backend", test_backend)
+
+from src.config import settings
+settings.ENFORCEMENT_MODE = 'enforce'
