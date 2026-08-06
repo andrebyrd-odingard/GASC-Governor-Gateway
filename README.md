@@ -75,6 +75,14 @@ This requires configuring `JWT_SECRET` via environment variables.
     pip install -r requirements.txt
     ```
 
+## 📊 Audit & Conformance
+
+This Gateway is designed to be evaluated by the `gasc-audit` CLI tool against the GASC-ED v1.1 rubric. 
+
+If you run the audit engine against the Gateway's own internally generated artifacts, the tool will proudly return `overall_audit_passed: false`. By design, **6 out of 10 rows do not count toward conformance** in this scenario, scoring either as `NOT-EXERCISED` or `SELF-ATTESTED`. 
+
+Specifically, because the Gateway cannot independently verify its own snapshots (Rule 2), the audit engine correctly flags these rows as `SELF-ATTESTED`. This proves the audit rubric is not decorative—it actively prevents systems from grading their own homework. Passing a full audit requires an external orchestrator to supply a genuine independent snapshot.
+
 ## 🧪 Testing and Validation
 
 This repository includes a comprehensive, multi-layered test suite that verifies the core tenets of the GASC-ED v1.1 specification, including unit tests for JSON schemas and OPA policies, integration tests for the FastAPI gateway, and an End-to-End Adversarial Fault Injection scenario.

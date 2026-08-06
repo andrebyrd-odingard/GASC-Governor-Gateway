@@ -7,7 +7,6 @@
     "detected_at_utc",
     "poisoned_root_id",
     "computed_blast_radius_C_p",
-    "independent_snapshot_hash",
     "monotonic_ledger_digest_post_transition"
   ],
   "properties": {
@@ -24,7 +23,7 @@
     "independent_snapshot_hash": {
       "type": "string",
       "pattern": "^[a-fA-F0-9]{64}$",
-      "description": "SHA-256 hash of independent state snapshot used to compute blast radius (Rule 2)."
+      "description": "SHA-256 hash of independent state snapshot used to compute blast radius (Rule 2). Must originate from an external orchestrator; its absence causes Row 2 to score SELF-ATTESTED."
     },
     "monotonic_ledger_digest_post_transition": {
       "type": "string",

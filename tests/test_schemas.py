@@ -65,7 +65,6 @@ def get_valid_quarantine_event():
         "detected_at_utc": "2026-10-27T10:00:00Z",
         "poisoned_root_id": "c1b2c3d4-e5f6-7890-1234-567890abcdef",
         "computed_blast_radius_C_p": ["c1b2c3d4-e5f6-7890-1234-567890abcdef"],
-        "independent_snapshot_hash": "a" * 64,
         "monotonic_ledger_digest_post_transition": "b" * 64
     }
 
@@ -74,7 +73,7 @@ def test_valid_quarantine_event():
     schema = load_schema("quarantine_event.json")
     validate(instance=payload, schema=schema)
 
-def test_invalid_quarantine_event_missing_hash():
+def test_invalid_quarantine_event_bad_hash_format():
     payload = get_valid_quarantine_event()
     schema = load_schema("quarantine_event.json")
     payload["independent_snapshot_hash"] = "short-hash"
