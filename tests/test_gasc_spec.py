@@ -115,9 +115,9 @@ def test_rego_verification_separation_fail_planner_output():
 
 def test_rego_quarantine_integrity_pass():
     input_data = {
-        "quarantine_set_Q_current": ["1", "2"],
-        "quarantine_set_Q_proposed": ["1", "2", "3"],
-        "committed_dag_node_ids": ["parent_1"],
+        "parent_status": [
+            {"parent_node_id": "parent_1", "exists": True, "quarantined": False}
+        ],
         "write_request": {
             "parent_dependency_commitments": [
                 {"parent_node_id": "parent_1"}

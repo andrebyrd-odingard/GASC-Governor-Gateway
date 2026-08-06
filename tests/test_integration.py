@@ -71,6 +71,7 @@ def test_integration_submit_valid_payload():
     payload = create_valid_payload()
     response = client.post("/submit-candidate", json=payload)
     
+    print(response.json())
     assert response.status_code == 200
     assert response.json()["status"] == "success"
     

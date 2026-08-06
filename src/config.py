@@ -9,5 +9,9 @@ class Settings(BaseSettings):
     DEBUG_MODE: bool = False
     RECOVERY_ADAPTER_URL: str | None = None
     RECOVERY_ADAPTER_PUBLIC_KEY: str | None = None
+    CONTINUATION_HORIZON_SECONDS: int = 86400
+    MAX_WITHDRAWAL_AMPLIFICATION: int = 100
+    RECURRENCE_SIGNAL_RATE_LIMIT: int = 10
+    TRUST_RENEWAL_REQUIRED: bool = True
 
 settings = Settings()

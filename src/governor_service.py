@@ -58,6 +58,26 @@ class ContextCompactedEvent(BaseModel):
     agent_signature: str
     method_id: str = "llm_summary"
 
+
+class ObserveEvent(BaseModel):
+    node_id: str
+    recurrence_class: str
+    detected_at_utc: str
+    evidence: dict = {}
+    adapter_signature: str | None = None
+
+
+class CalibrateRequest(BaseModel):
+    run_id: str
+    run_at_utc: str
+    seeded_count: int
+    detected_count: int
+    sensitivity_floor: float
+    monitored_period: dict
+
+class RenewTrustRequest(BaseModel):
+    node_id: str
+
 class ExternalEffectEvent(BaseModel):
     idempotency_key: str
     node_id: str
@@ -271,6 +291,30 @@ class MemoryStateBackend(BaseStateBackend):
     async def reset(self):
         async with self.lock: self._reset_sync()
 
+    async def record_reintegration(self, node_id: str, predecessor_id: str, horizon_seconds: int): pass
+    async def get_active_horizon_set(self) -> Dict[str, dict]: return {}
+    async def get_expired_horizon_set(self) -> List[str]: return []
+    async def renew_trust(self, node_id: str, horizon_seconds: int): pass
+    async def apply_withdrawal_transaction(self, event: dict, w_r: List[str]): pass
+    async def get_withdrawal_ledger(self) -> Dict[str, dict]: return {}
+    async def record_calibration_run(self, run: dict): pass
+    async def get_calibration_runs(self) -> List[dict]: return []
+
+    async def nodes_exist(self, node_ids: List[str]) -> Dict[str, bool]:
+        async with self.lock:
+            return {nid: (nid in self.dag) for nid in node_ids}
+
+    async def are_quarantined(self, node_ids: List[str]) -> Dict[str, bool]:
+        async with self.lock:
+            q_set = set(self.quarantine_ledger)
+            return {nid: (nid in q_set) for nid in node_ids}
+
+    async def compute_covers_interval_gap(self, covers: List[str]) -> List[str]:
+        async with self.lock:
+            return _compute_covers_interval_gap(self.dag, covers)
+
+
+
 if settings.BACKEND_TYPE == "sqlite":
     from src.sqlite_backend import SqliteStateBackend
     backend = SqliteStateBackend()
@@ -396,7 +440,7 @@ async def submit_candidate(request: Request):
     try:
         validate(instance=payload, schema=PAYLOAD_SCHEMA)
     except jsonschema.exceptions.ValidationError as e:
-        raise HTTPException(status_code=400, detail=f"Schema validation failed: {e.message}")
+        print(f"Schema validation failed: {e.message}"); raise HTTPException(status_code=400, detail=f"Schema validation failed: {e.message}")
         
     token = payload.get("ephemeral_nhi", {}).get("session_token")
     identity_id = payload.get("ephemeral_nhi", {}).get("identity_id")
@@ -405,19 +449,29 @@ async def submit_candidate(request: Request):
     if not verify_cryptographic_signature(payload):
         raise HTTPException(status_code=401, detail="Cryptographic signature verification failed")
 
-    q_ledger = await backend.get_quarantine_ledger()
-    dag = await backend.get_dag()
+    import asyncio
+    parent_ids = [p["parent_node_id"] for p in payload.get("parent_dependency_commitments", [])]
+    if len(parent_ids) > 256: # settings.MAX_DECLARED_PARENTS
+        raise HTTPException(status_code=400, detail="Too many declared parents")
 
-    # Topological Interval Gap (if COMPACTION)
+    exists_map, quarantined_map = await asyncio.gather(
+        backend.nodes_exist(parent_ids),
+        backend.are_quarantined(parent_ids),
+    )
+
     if payload.get("node_type") == "COMPACTION":
-        payload["covers_interval_gap"] = _compute_covers_interval_gap(dag, payload.get("covers", [])) 
-    
-    # 1. Lineage & Monotonicity
+        payload["covers_interval_gap"] = await backend.compute_covers_interval_gap(payload.get("covers", []))
+
     integrity_input = {
-        "quarantine_set_Q_current": q_ledger,
-        "quarantine_set_Q_proposed": q_ledger,
-        "committed_dag_node_ids": list(dag.keys()),
-        "write_request": payload
+        "write_request": payload,
+        "parent_status": [
+            {
+                "parent_node_id": pid,
+                "exists": exists_map.get(pid, False),
+                "quarantined": quarantined_map.get(pid, False),
+            }
+            for pid in parent_ids
+        ],
     }
 
     is_integrity_valid = await evaluate_opa_policy(
@@ -427,14 +481,21 @@ async def submit_candidate(request: Request):
     )
     
     if not is_integrity_valid:
-        has_tainted_parent = any(p["parent_node_id"] in q_ledger for p in payload.get("parent_dependency_commitments", []))
-        if has_tainted_parent:
-            poisoned_root = [p["parent_node_id"] for p in payload.get("parent_dependency_commitments", []) if p["parent_node_id"] in q_ledger][0]
+        tainted = [pid for pid in parent_ids if quarantined_map.get(pid)]
+        if tainted:
+            poisoned_root = tainted[0]
             
             await backend.commit_node(payload) 
             c_p = await backend.compute_blast_radius(poisoned_root)
             
+            from src.r6_utils import process_recurrence
+            active_horizons = await backend.get_active_horizon_set()
+            for n in c_p:
+                if n in active_horizons:
+                    await process_recurrence(backend, n, "PROHIBITED_PATH", "internal_hook")
+            
             dag_state = await backend.get_dag()
+            q_ledger = await backend.get_quarantine_ledger()
             updated_ledger = q_ledger + [payload.get("payload_id")]
             monotonic_ledger_digest = hashlib.sha256(json.dumps(updated_ledger, sort_keys=True).encode()).hexdigest()
             
@@ -457,7 +518,7 @@ async def submit_candidate(request: Request):
             "target_replaced_node_id": "none",
             "admissible_frontier_parent_ids": [p["parent_node_id"] for p in payload.get("parent_dependency_commitments", [])],
         },
-        "quarantine_set_Q": q_ledger,
+        "quarantine_set_Q": [pid for pid in parent_ids if quarantined_map.get(pid)],
         "auth_context": auth_context,
         "request_timestamp_epoch": int(datetime.now(timezone.utc).timestamp()),
         "verifier_execution_status": auth_context.get("verifier_execution_status", "PENDING")
@@ -564,6 +625,11 @@ async def designate_poison(event: DesignationEvent, request: Request):
         
     c_p = await backend.compute_blast_radius(event.poisoned_node_id)
     
+    from src.r6_utils import process_recurrence
+    active_horizons = await backend.get_active_horizon_set()
+    for n in c_p:
+        if n in active_horizons:
+            await process_recurrence(backend, n, "RENEWED_DESIGNATION", "internal_hook")
     
     # Calculate what the ledger digest will be
     updated_ledger = list(set(q_ledger + c_p))
@@ -656,6 +722,7 @@ async def designate_poison(event: DesignationEvent, request: Request):
                 # But we just admit it directly since the Rego checks happen in submit-candidate usually,
                 # actually we should commit it to the DAG.
                 await backend.commit_node(candidate)
+                await backend.record_reintegration(candidate.get("payload_id"), comp_node, settings.CONTINUATION_HORIZON_SECONDS)
                 rc_data["disposition"] = "REDUCIBLE"
                 rc_data["reconstructed_node_id"] = candidate.get("payload_id")
                 await backend.update_repair_candidate(comp_node, rc_data)
@@ -668,6 +735,64 @@ async def designate_poison(event: DesignationEvent, request: Request):
                 rc_data["reason"] = "backend_unavailable"
     
     return {"status": "success", "event": q_event}
+
+
+@app.post("/observe")
+async def observe_recurrence(event: ObserveEvent, request: Request):
+    claims = verify_role_jwt(request, "designator")
+    
+    if event.recurrence_class not in ["FUNCTIONAL_FAILURE", "VERIFIER_CONTRADICTION"]:
+        raise HTTPException(status_code=400, detail="Invalid recurrence class")
+        
+    if event.recurrence_class == "VERIFIER_CONTRADICTION":
+        if not event.adapter_signature:
+            raise HTTPException(status_code=403, detail="adapter_signature required for VERIFIER_CONTRADICTION")
+            
+        adapter_key = settings.RECOVERY_ADAPTER_PUBLIC_KEY
+        if not adapter_key:
+            raise HTTPException(status_code=500, detail="RECOVERY_ADAPTER_PUBLIC_KEY not configured")
+            
+        try:
+            from ecdsa import VerifyingKey, NIST256p
+            vk = VerifyingKey.from_string(bytes.fromhex(adapter_key), curve=NIST256p)
+            if not vk.verify(bytes.fromhex(event.adapter_signature), event.node_id.encode()):
+                raise HTTPException(status_code=403, detail="Invalid adapter signature")
+        except Exception:
+            raise HTTPException(status_code=403, detail="Invalid adapter signature")
+            
+    from src.r6_utils import process_recurrence
+    await process_recurrence(backend, event.node_id, event.recurrence_class, claims.get("sub"), event.evidence)
+    return {"status": "success"}
+
+@app.post("/renew-trust")
+async def renew_trust(req: RenewTrustRequest, request: Request):
+    claims = verify_role_jwt(request, "designator")
+    
+    q_ledger = await backend.get_quarantine_ledger()
+    if req.node_id in q_ledger:
+        raise HTTPException(status_code=403, detail="Cannot renew trust: Prohibited path from historical quarantine exists (node is tainted)")
+        
+    await backend.renew_trust(req.node_id, settings.CONTINUATION_HORIZON_SECONDS)
+    return {"status": "success"}
+
+
+@app.post("/calibrate")
+async def calibrate_harness(req: CalibrateRequest, request: Request):
+    verify_role_jwt(request, "admin")
+    if not settings.DEBUG_MODE:
+        raise HTTPException(status_code=403, detail="Calibration requires DEBUG_MODE")
+        
+    await backend.record_calibration_run(req.model_dump())
+    return {"status": "success"}
+
+@app.get("/recurrence-report")
+async def get_recurrence_report(request: Request):
+    verify_role_jwt(request, "admin")
+    return {
+        "active_horizons": await backend.get_active_horizon_set(),
+        "expired_horizons": await backend.get_expired_horizon_set(),
+        "withdrawal_ledger": await backend.get_withdrawal_ledger()
+    }
 
 @app.get("/db-state")
 async def get_db_state(request: Request):

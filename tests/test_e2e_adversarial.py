@@ -124,8 +124,18 @@ def test_e2e_adversarial_injection_via_designate():
             "observed_catch_rate": 1.0,
             "preregistered_target_catch_rate": 0.95
         },
-        "reintegrations": [{"recovered_node_id": "r1"}],
-        "recurrence_monitor": {},
+        "reintegrations": [{"gate_execution_evidence": {"approved": True}}],
+        "recurrence_monitor": {
+            "calibration_run": {
+                "seeded_count": 10,
+                "detected_count": 8,
+                "sensitivity_floor": 0.8
+            }
+        },
+        "disposed_targets": [
+            {"disposition": "REDUCIBLE"},
+            {"disposition": "IRREDUCIBLE"}
+        ],
         "disposed_targets": [
             {"disposition": "REDUCIBLE"},
             {"disposition": "IRREDUCIBLE"}

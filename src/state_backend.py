@@ -22,4 +22,26 @@ class BaseStateBackend(ABC):
     async def get_checkpoints(self) -> Dict[str, dict]: pass
     @abstractmethod
     async def reset(self): pass
-
+    @abstractmethod
+    async def record_reintegration(self, node_id: str, predecessor_id: str, horizon_seconds: int): pass
+    @abstractmethod
+    async def get_active_horizon_set(self) -> Dict[str, dict]: pass
+    @abstractmethod
+    async def get_expired_horizon_set(self) -> List[str]: pass
+    @abstractmethod
+    async def renew_trust(self, node_id: str, horizon_seconds: int): pass
+    @abstractmethod
+    async def apply_withdrawal_transaction(self, event: dict, w_r: List[str]): pass
+    @abstractmethod
+    async def get_withdrawal_ledger(self) -> Dict[str, dict]: pass
+    @abstractmethod
+    async def record_calibration_run(self, run: dict): pass
+    @abstractmethod
+    async def get_calibration_runs(self) -> List[dict]: pass
+    
+    @abstractmethod
+    async def nodes_exist(self, node_ids: List[str]) -> Dict[str, bool]: pass
+    @abstractmethod
+    async def are_quarantined(self, node_ids: List[str]) -> Dict[str, bool]: pass
+    @abstractmethod
+    async def compute_covers_interval_gap(self, covers: List[str]) -> List[str]: pass

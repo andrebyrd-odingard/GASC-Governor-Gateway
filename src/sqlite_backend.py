@@ -59,6 +59,41 @@ class SqliteStateBackend(BaseStateBackend):
                 recorded_at_utc TEXT
             )''')
             
+            await db.execute('''CREATE TABLE IF NOT EXISTS reintegration_horizon (
+                node_id TEXT PRIMARY KEY,
+                admitted_at_utc TEXT NOT NULL,
+                trust_expires_utc TEXT NOT NULL,
+                predecessor_id TEXT NOT NULL,
+                renewal_count INTEGER DEFAULT 0
+            )''')
+            
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_horizon_expiry ON reintegration_horizon(trust_expires_utc)")
+            
+            await db.execute('''CREATE TABLE IF NOT EXISTS recurrence_events (
+                event_id TEXT PRIMARY KEY,
+                node_id TEXT NOT NULL,
+                recurrence_class TEXT NOT NULL,
+                detected_at_utc TEXT NOT NULL,
+                signal_source TEXT NOT NULL,
+                event_json TEXT NOT NULL
+            )''')
+            
+            await db.execute('''CREATE TABLE IF NOT EXISTS withdrawal_ledger (
+                node_id TEXT PRIMARY KEY,
+                withdrawn_at_utc TEXT NOT NULL,
+                triggering_event_id TEXT NOT NULL,
+                withdrawal_reason TEXT NOT NULL
+            )''')
+            
+            await db.execute('''CREATE TABLE IF NOT EXISTS calibration_runs (
+                run_id TEXT PRIMARY KEY,
+                run_at_utc TEXT NOT NULL,
+                seeded_count INTEGER NOT NULL,
+                detected_count INTEGER NOT NULL,
+                sensitivity_floor REAL NOT NULL,
+                monitored_period_json TEXT NOT NULL
+            )''')
+            
             await db.commit()
 
     async def get_dag(self) -> Dict[str, Any]:
@@ -306,6 +341,10 @@ class SqliteStateBackend(BaseStateBackend):
             await db.execute("DELETE FROM repair_candidates")
             await db.execute("DELETE FROM checkpoints")
             await db.execute("DELETE FROM external_effects")
+            await db.execute("DELETE FROM reintegration_horizon")
+            await db.execute("DELETE FROM recurrence_events")
+            await db.execute("DELETE FROM withdrawal_ledger")
+            await db.execute("DELETE FROM calibration_runs")
             await db.commit()
             
         # Re-initialize basic data
@@ -313,3 +352,131 @@ class SqliteStateBackend(BaseStateBackend):
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("INSERT OR IGNORE INTO quarantine_ledger (node_id) VALUES (?)", ("quarantined-node-A",))
             await db.commit()
+
+    async def record_reintegration(self, node_id: str, predecessor_id: str, horizon_seconds: int):
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(seconds=horizon_seconds)
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO reintegration_horizon (node_id, admitted_at_utc, trust_expires_utc, predecessor_id) VALUES (?, ?, ?, ?)",
+                (node_id, now.isoformat() + "Z", expires.isoformat() + "Z", predecessor_id)
+            )
+            await db.commit()
+
+    async def get_active_horizon_set(self) -> Dict[str, dict]:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat() + "Z"
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("SELECT node_id, trust_expires_utc, predecessor_id, renewal_count FROM reintegration_horizon WHERE trust_expires_utc > ?", (now,)) as cursor:
+                rows = await cursor.fetchall()
+                return {r[0]: {"trust_expires_utc": r[1], "predecessor_id": r[2], "renewal_count": r[3]} for r in rows}
+
+    async def get_expired_horizon_set(self) -> List[str]:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat() + "Z"
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("SELECT node_id FROM reintegration_horizon WHERE trust_expires_utc <= ?", (now,)) as cursor:
+                rows = await cursor.fetchall()
+                return [r[0] for r in rows]
+
+    async def renew_trust(self, node_id: str, horizon_seconds: int):
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(seconds=horizon_seconds)
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE reintegration_horizon SET trust_expires_utc = ?, renewal_count = renewal_count + 1 WHERE node_id = ?",
+                (expires.isoformat() + "Z", node_id)
+            )
+            await db.commit()
+
+    async def apply_withdrawal_transaction(self, event: dict, w_r: List[str]):
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat() + "Z"
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO recurrence_events (event_id, node_id, recurrence_class, detected_at_utc, signal_source, event_json) VALUES (?, ?, ?, ?, ?, ?)",
+                (event["event_id"], event["node_id"], event["recurrence_class"], event["detected_at_utc"], event["signal_source"], json.dumps(event))
+            )
+            for i, node_id in enumerate(w_r):
+                reason = "DIRECTLY_IMPLICATED" if i == 0 else "UNEXAMINED_DEPENDENT"
+                await db.execute(
+                    "INSERT OR IGNORE INTO withdrawal_ledger (node_id, withdrawn_at_utc, triggering_event_id, withdrawal_reason) VALUES (?, ?, ?, ?)",
+                    (node_id, now, event["event_id"], reason)
+                )
+            await db.commit()
+
+    async def get_withdrawal_ledger(self) -> Dict[str, dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("SELECT node_id, withdrawn_at_utc, triggering_event_id, withdrawal_reason FROM withdrawal_ledger") as cursor:
+                rows = await cursor.fetchall()
+                return {r[0]: {"withdrawn_at_utc": r[1], "triggering_event_id": r[2], "withdrawal_reason": r[3]} for r in rows}
+
+    async def record_calibration_run(self, run: dict):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO calibration_runs (run_id, run_at_utc, seeded_count, detected_count, sensitivity_floor, monitored_period_json) VALUES (?, ?, ?, ?, ?, ?)",
+                (run["run_id"], run["run_at_utc"], run["seeded_count"], run["detected_count"], run["sensitivity_floor"], json.dumps(run["monitored_period"]))
+            )
+            await db.commit()
+
+    async def get_calibration_runs(self) -> List[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("SELECT run_id, run_at_utc, seeded_count, detected_count, sensitivity_floor, monitored_period_json FROM calibration_runs") as cursor:
+                rows = await cursor.fetchall()
+                return [{"run_id": r[0], "run_at_utc": r[1], "seeded_count": r[2], "detected_count": r[3], "sensitivity_floor": r[4], "monitored_period": json.loads(r[5])} for r in rows]
+
+
+    async def nodes_exist(self, node_ids: List[str]) -> Dict[str, bool]:
+        if not node_ids:
+            return {}
+        uniq = list(dict.fromkeys(node_ids))
+        q = f"SELECT node_id FROM nodes WHERE node_id IN ({','.join('?' * len(uniq))})"
+        import aiosqlite
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(q, uniq) as cur:
+                found = {r[0] for r in await cur.fetchall()}
+        return {nid: (nid in found) for nid in uniq}
+
+    async def are_quarantined(self, node_ids: List[str]) -> Dict[str, bool]:
+        if not node_ids:
+            return {}
+        uniq = list(dict.fromkeys(node_ids))
+        q = f"SELECT node_id FROM quarantine_ledger WHERE node_id IN ({','.join('?' * len(uniq))})"
+        import aiosqlite
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(q, uniq) as cur:
+                found = {r[0] for r in await cur.fetchall()}
+        return {nid: (nid in found) for nid in uniq}
+
+    async def compute_covers_interval_gap(self, covers: List[str]) -> List[str]:
+        if not covers: return []
+        uniq = list(dict.fromkeys(covers))
+        placeholders = ",".join(["?"] * len(uniq))
+        query = f"""
+            WITH RECURSIVE
+            descendants(node_id) AS (
+                SELECT node_id FROM nodes WHERE node_id IN ({placeholders})
+                UNION
+                SELECT e.child_id FROM edges e
+                INNER JOIN descendants d ON e.parent_id = d.node_id
+            ),
+            ancestors(node_id) AS (
+                SELECT node_id FROM nodes WHERE node_id IN ({placeholders})
+                UNION
+                SELECT e.parent_id FROM edges e
+                INNER JOIN ancestors a ON e.child_id = a.node_id
+            )
+            SELECT node_id FROM descendants
+            INTERSECT
+            SELECT node_id FROM ancestors
+            EXCEPT
+            SELECT node_id FROM nodes WHERE node_id IN ({placeholders})
+        """
+        params = tuple(uniq) * 3
+        import aiosqlite
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(query, params) as cursor:
+                rows = await cursor.fetchall()
+                return sorted([r[0] for r in rows])
