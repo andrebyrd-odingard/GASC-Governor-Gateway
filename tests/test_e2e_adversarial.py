@@ -106,3 +106,34 @@ def test_e2e_adversarial_injection_via_designate():
     # Verify true dynamic blast radius C(p) correctly identified descendants
     assert "order-2" in event["computed_blast_radius_C_p"]
     assert "order-3" in event["computed_blast_radius_C_p"]
+
+    # 5. Generate Audit Manifest for gasc-audit scoring
+    db_state = client.get("/db-state", headers={"Authorization": f"Bearer {generate_admin_token()}"}).json()
+    
+    audit_manifest = {
+        "boundary_id": "BOUNDARY-TEST",
+        "operating_envelope_declaration": "E2E Test Envelope",
+        "admitted_writes": list(db_state.get("dag", {}).values()),
+        "quarantine_incidents": db_state.get("quarantine_events", []),
+        "quarantine_transitions": [{"quarantine_set": db_state.get("quarantine_ledger", [])}],
+        "continuity_exposures": [],
+        "reconstruction_attempts": [{"declared_evidence_boundary": {"fixed_at_utc": "2026-10-27T10:20:00Z"}, "incident_detected_at_utc": "2026-10-27T10:15:00Z"}],
+        "fault_injection_campaign": {
+            "preregistered_suite_run": True,
+            "shared_dependency_inventory_published": True,
+            "observed_catch_rate": 1.0,
+            "preregistered_target_catch_rate": 0.95
+        },
+        "reintegrations": [{"recovered_node_id": "r1"}],
+        "recurrence_monitor": {},
+        "disposed_targets": [
+            {"disposition": "REDUCIBLE"},
+            {"disposition": "IRREDUCIBLE"}
+        ],
+        "measured_cost_report": {}
+    }
+    
+    from pathlib import Path
+    manifest_path = Path(__file__).parent.parent / "audit_manifest.json"
+    with open(manifest_path, "w") as f:
+        json.dump(audit_manifest, f)

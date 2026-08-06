@@ -12,3 +12,4 @@ respx
 litellm>=1.0.0
 aiosqlite>=0.20.0
 numpy
+pytest-asyncio
