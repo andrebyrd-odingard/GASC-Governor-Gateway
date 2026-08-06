@@ -62,7 +62,11 @@ def backend_setup(request, monkeypatch, tmp_path):
         else:
             asyncio.run(test_backend.init_db())
             
-    import src.governor_service; monkeypatch.setattr(src.governor_service, "backend", test_backend)
+    import src.governor_service
+    monkeypatch.setattr(src.governor_service, "backend", test_backend)
+    # Reset the admission lock for each test to avoid event-loop binding issues
+    from src.governor_service import _AdmissionLock
+    monkeypatch.setattr(src.governor_service, "_admission_lock", _AdmissionLock())
 
 from src.config import settings
 settings.ENFORCEMENT_MODE = 'enforce'
