@@ -435,7 +435,6 @@ async def submit_candidate(request: Request):
             c_p = await backend.compute_blast_radius(poisoned_root)
             
             dag_state = await backend.get_dag()
-            independent_snapshot_hash = hashlib.sha256(json.dumps(dag_state, sort_keys=True).encode()).hexdigest()
             updated_ledger = q_ledger + [payload.get("payload_id")]
             monotonic_ledger_digest = hashlib.sha256(json.dumps(updated_ledger, sort_keys=True).encode()).hexdigest()
             
@@ -444,7 +443,6 @@ async def submit_candidate(request: Request):
                 "detected_at_utc": datetime.now(timezone.utc).isoformat() + "Z",
                 "poisoned_root_id": poisoned_root,
                 "computed_blast_radius_C_p": c_p,
-                "independent_snapshot_hash": independent_snapshot_hash,
                 "monotonic_ledger_digest_post_transition": monotonic_ledger_digest
             }
             await backend.apply_quarantine_transaction(event, [payload.get("payload_id")])
@@ -566,7 +564,6 @@ async def designate_poison(event: DesignationEvent, request: Request):
         
     c_p = await backend.compute_blast_radius(event.poisoned_node_id)
     
-    independent_snapshot_hash = hashlib.sha256(json.dumps(dag, sort_keys=True).encode()).hexdigest()
     
     # Calculate what the ledger digest will be
     updated_ledger = list(set(q_ledger + c_p))
@@ -577,7 +574,6 @@ async def designate_poison(event: DesignationEvent, request: Request):
         "detected_at_utc": datetime.now(timezone.utc).isoformat() + "Z",
         "poisoned_root_id": event.poisoned_node_id,
         "computed_blast_radius_C_p": c_p,
-        "independent_snapshot_hash": independent_snapshot_hash,
         "monotonic_ledger_digest_post_transition": monotonic_ledger_digest,
         "designator_identity": claims.get("sub"),
         "designation_reason": event.reason
