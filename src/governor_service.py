@@ -142,6 +142,10 @@ class MemoryStateBackend(BaseStateBackend):
         self.checkpoints = {}
         self.external_effects = {}
         self.shadow_decisions = []
+        self._reintegration_horizon = {}
+        self._recurrence_events = []
+        self._withdrawal_ledger = {}
+        self._calibration_runs = []
         
     async def get_dag(self) -> Dict[str, Any]:
         async with self.lock: return self.dag.copy()
@@ -155,8 +159,12 @@ class MemoryStateBackend(BaseStateBackend):
     async def update_repair_candidate(self, node_id: str, data: dict):
         async with self.lock: self.repair_candidates[node_id] = data
         
-    async def commit_node(self, payload: dict):
-        async with self.lock: self.dag[payload["payload_id"]] = payload
+    async def commit_node(self, payload: dict) -> bool:
+        async with self.lock:
+            if payload["payload_id"] in self.dag:
+                return False  # Idempotent no-op
+            self.dag[payload["payload_id"]] = payload
+            return True
         
     async def log_quarantine_event(self, event: dict):
         async with self.lock: self.quarantine_events.append(event)
@@ -303,14 +311,75 @@ class MemoryStateBackend(BaseStateBackend):
     async def reset(self):
         async with self.lock: self._reset_sync()
 
-    async def record_reintegration(self, node_id: str, predecessor_id: str, horizon_seconds: int): pass
-    async def get_active_horizon_set(self) -> Dict[str, dict]: return {}
-    async def get_expired_horizon_set(self) -> List[str]: return []
-    async def renew_trust(self, node_id: str, horizon_seconds: int): pass
-    async def apply_withdrawal_transaction(self, event: dict, w_r: List[str]): pass
-    async def get_withdrawal_ledger(self) -> Dict[str, dict]: return {}
-    async def record_calibration_run(self, run: dict): pass
-    async def get_calibration_runs(self) -> List[dict]: return []
+    async def record_reintegration(self, node_id: str, predecessor_id: str, horizon_seconds: int):
+        from datetime import timedelta
+        async with self.lock:
+            if not hasattr(self, '_reintegration_horizon'):
+                self._reintegration_horizon = {}
+            now = datetime.now(timezone.utc)
+            self._reintegration_horizon[node_id] = {
+                "admitted_at_utc": now.isoformat() + "Z",
+                "trust_expires_utc": (now + timedelta(seconds=horizon_seconds)).isoformat() + "Z",
+                "predecessor_id": predecessor_id,
+                "renewal_count": 0
+            }
+
+    async def get_active_horizon_set(self) -> Dict[str, dict]:
+        async with self.lock:
+            if not hasattr(self, '_reintegration_horizon'):
+                return {}
+            now = datetime.now(timezone.utc).isoformat() + "Z"
+            return {k: v for k, v in self._reintegration_horizon.items() if v["trust_expires_utc"] > now}
+
+    async def get_expired_horizon_set(self) -> List[str]:
+        async with self.lock:
+            if not hasattr(self, '_reintegration_horizon'):
+                return []
+            now = datetime.now(timezone.utc).isoformat() + "Z"
+            return [k for k, v in self._reintegration_horizon.items() if v["trust_expires_utc"] <= now]
+
+    async def renew_trust(self, node_id: str, horizon_seconds: int):
+        from datetime import timedelta
+        async with self.lock:
+            if hasattr(self, '_reintegration_horizon') and node_id in self._reintegration_horizon:
+                now = datetime.now(timezone.utc)
+                self._reintegration_horizon[node_id]["trust_expires_utc"] = (now + timedelta(seconds=horizon_seconds)).isoformat() + "Z"
+                self._reintegration_horizon[node_id]["renewal_count"] += 1
+
+    async def apply_withdrawal_transaction(self, event: dict, w_r: List[str]):
+        async with self.lock:
+            if not hasattr(self, '_recurrence_events'):
+                self._recurrence_events = []
+            if not hasattr(self, '_withdrawal_ledger'):
+                self._withdrawal_ledger = {}
+            self._recurrence_events.append(event)
+            now = datetime.now(timezone.utc).isoformat() + "Z"
+            for i, node_id in enumerate(w_r):
+                if node_id not in self._withdrawal_ledger:
+                    reason = "DIRECTLY_IMPLICATED" if i == 0 else "UNEXAMINED_DEPENDENT"
+                    self._withdrawal_ledger[node_id] = {
+                        "withdrawn_at_utc": now,
+                        "triggering_event_id": event["event_id"],
+                        "withdrawal_reason": reason
+                    }
+
+    async def get_withdrawal_ledger(self) -> Dict[str, dict]:
+        async with self.lock:
+            if not hasattr(self, '_withdrawal_ledger'):
+                return {}
+            return dict(self._withdrawal_ledger)
+
+    async def record_calibration_run(self, run: dict):
+        async with self.lock:
+            if not hasattr(self, '_calibration_runs'):
+                self._calibration_runs = []
+            self._calibration_runs.append(run)
+
+    async def get_calibration_runs(self) -> List[dict]:
+        async with self.lock:
+            if not hasattr(self, '_calibration_runs'):
+                return []
+            return list(self._calibration_runs)
     
     async def record_shadow_decision(self, decision_id: str, node_id: str, evaluated_at_utc: str, would_have_blocked: bool, reason: str, parent_status_json: str, policy_bundle_digest: str, writer_identity: str):
         async with self.lock:
@@ -686,18 +755,20 @@ async def submit_candidate(request: Request):
         parent_status_json = json.dumps([{"parent_node_id": pid, "exists": exists_map.get(pid, False), "quarantined": quarantined_map.get(pid, False)} for pid in parent_ids])
 
         if settings.ENFORCEMENT_MODE == "shadow":
-            await backend.record_shadow_decision(
-                decision_id=decision_id,
-                node_id=payload.get("payload_id"),
-                evaluated_at_utc=datetime.now(timezone.utc).isoformat() + "Z",
-                would_have_blocked=not decision["admit"],
-                reason=decision.get("reason", ""),
-                parent_status_json=parent_status_json,
-                policy_bundle_digest=settings.OPA_POLICY_BUNDLE or "none",
-                writer_identity=writer_identity
-            )
+            # Idempotency: if commit returns False, this is a duplicate — skip audit
+            is_new = await backend.commit_node(payload)
+            if is_new:
+                await backend.record_shadow_decision(
+                    decision_id=decision_id,
+                    node_id=payload.get("payload_id"),
+                    evaluated_at_utc=datetime.now(timezone.utc).isoformat() + "Z",
+                    would_have_blocked=not decision["admit"],
+                    reason=decision.get("reason", ""),
+                    parent_status_json=parent_status_json,
+                    policy_bundle_digest=settings.OPA_POLICY_BUNDLE or "none",
+                    writer_identity=writer_identity
+                )
             # Shadow mode: always admit unless invalid signature/schema (which we already threw for)
-            await backend.commit_node(payload)
             return {"status": "success", "message": "State node committed to DAG (Shadow Mode)."}
         else:
             if not decision["admit"]:
@@ -743,17 +814,19 @@ async def submit_candidate(request: Request):
                 else:
                     raise HTTPException(status_code=403 if decision.get("reason") == "Verification Separation Policy Failed" else 400, detail=decision.get("reason", "Policy Failed"))
 
-            await backend.record_shadow_decision(
-                decision_id=decision_id,
-                node_id=payload.get("payload_id"),
-                evaluated_at_utc=datetime.now(timezone.utc).isoformat() + "Z",
-                would_have_blocked=False,
-                reason="",
-                parent_status_json=parent_status_json,
-                policy_bundle_digest=settings.OPA_POLICY_BUNDLE or "none",
-                writer_identity=writer_identity
-            )
-            await backend.commit_node(payload)
+            # Idempotency: if commit returns False, this is a duplicate — skip audit
+            is_new = await backend.commit_node(payload)
+            if is_new:
+                await backend.record_shadow_decision(
+                    decision_id=decision_id,
+                    node_id=payload.get("payload_id"),
+                    evaluated_at_utc=datetime.now(timezone.utc).isoformat() + "Z",
+                    would_have_blocked=False,
+                    reason="",
+                    parent_status_json=parent_status_json,
+                    policy_bundle_digest=settings.OPA_POLICY_BUNDLE or "none",
+                    writer_identity=writer_identity
+                )
             return {"status": "success", "message": "State node committed to DAG."}
 
 @app.post("/declare-external-effect")

@@ -140,7 +140,15 @@ class SqliteStateBackend(BaseStateBackend):
         async with self._connect() as db:
             await self._set_repair_candidate(db, node_id, data)
 
-    async def commit_node(self, payload: dict):
+    async def commit_node(self, payload: dict) -> bool:
+        """
+        Commit a node to the DAG. Returns True if the node was newly inserted,
+        False if it already existed (idempotent duplicate).
+        
+        Uses INSERT OR IGNORE for idempotency: a duplicate payload_id is a no-op.
+        A retry that lands the same node twice must not produce a second audit
+        record, shadow decision, or quarantine event.
+        """
         node_id = payload["payload_id"]
         content_hash = payload.get("content_digest_sha256", "")
         parents = payload.get("parent_dependency_commitments", [])
@@ -153,20 +161,21 @@ class SqliteStateBackend(BaseStateBackend):
         payload_json = json.dumps(payload)
         
         async with self._connect() as db:
-            # We want to replace if exists to allow overwriting in tests or reintegration
-            await db.execute(
-                "INSERT OR REPLACE INTO nodes (node_id, payload_json, content_hash, commitment) VALUES (?, ?, ?, ?)",
+            cursor = await db.execute(
+                "INSERT OR IGNORE INTO nodes (node_id, payload_json, content_hash, commitment) VALUES (?, ?, ?, ?)",
                 (node_id, payload_json, content_hash, commitment)
             )
+            if cursor.rowcount == 0:
+                # Node already exists — idempotent no-op
+                return False
             
-            # Clear old edges and insert new ones
-            await db.execute("DELETE FROM edges WHERE child_id = ?", (node_id,))
             for p in parents:
                 await db.execute(
-                    "INSERT INTO edges (child_id, parent_id, edge_class) VALUES (?, ?, ?)",
+                    "INSERT OR IGNORE INTO edges (child_id, parent_id, edge_class) VALUES (?, ?, ?)",
                     (node_id, p["parent_node_id"], p.get("edge_class", "MATERIAL"))
                 )
             await db.commit()
+            return True
 
     async def log_quarantine_event(self, event: dict):
         # Fallback method, ideally use apply_quarantine_transaction
