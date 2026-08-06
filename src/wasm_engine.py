@@ -69,7 +69,7 @@ class OpaWasmEngine:
         mem = ctypes.string_at(ptr + addr)
         return mem.decode("utf-8")
 
-    def evaluate(self, input_dict: dict, entrypoint_name: str = None) -> dict:
+    def evaluate(self, input_dict: dict, entrypoint_name: str = None) -> list:
         input_str = json.dumps(input_dict)
         addr, length = self._write_string(input_str)
         
@@ -87,7 +87,10 @@ class OpaWasmEngine:
             if ep_key in self.entrypoints:
                 self.opa_eval_ctx_set_entrypoint(self.store, ctx, self.entrypoints[ep_key])
             else:
-                pass # Use default entrypoint if not found
+                raise RuntimeError(
+                    f"OPA WASM entrypoint not found: '{ep_key}'. "
+                    f"Available: {list(self.entrypoints.keys())}"
+                )
         
         self.eval_func(self.store, ctx)
 
@@ -96,4 +99,9 @@ class OpaWasmEngine:
         dump_addr = self.opa_json_dump(self.store, result_addr)
         result_str = self._read_string(dump_addr)
         
-        return json.loads(result_str)
+        parsed = json.loads(result_str)
+        # OPA WASM returns either a list of result sets or a bare value.
+        # Normalize to always return a list for consistent caller handling.
+        if isinstance(parsed, list):
+            return parsed
+        return [{"result": parsed}]

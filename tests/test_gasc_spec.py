@@ -146,3 +146,18 @@ def test_rego_quarantine_integrity_fail_monotonicity():
     }
     allowed = run_opa("gasc_quarantine_integrity.rego", "data.gasc.governor.integrity.allow_state_write", input_data)
     assert allowed == False
+
+
+def test_policies_directory_compiles_cleanly():
+    """
+    Guard: ensure no build artifacts (tarballs, WASM, compiled bundles) live
+    in policies/ — they cause OPA to fail with 'multiple default rules'.
+    """
+    cmd = [str(OPA_BIN), "check", str(POLICIES_DIR)]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    assert result.returncode == 0, (
+        f"OPA failed to compile policies/ cleanly.\n"
+        f"stderr: {result.stderr}\n"
+        f"This usually means a build artifact (.tar.gz, .wasm) was committed "
+        f"into the policies/ directory."
+    )

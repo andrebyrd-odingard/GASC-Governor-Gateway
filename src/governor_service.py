@@ -402,41 +402,52 @@ def verify_cryptographic_signature(payload: dict) -> bool:
         return False
 
 _wasm_engine_cache = {}
+_wasm_engine_lock = asyncio.Lock()
+
+
+class PolicyEvaluationError(Exception):
+    """Raised when the policy engine fails to evaluate (distinct from policy returning False)."""
+    pass
+
 
 async def evaluate_opa_policy(policy_package: str, query: str, input_data: dict) -> bool:
     if settings.OPA_POLICY_BUNDLE and os.path.exists(settings.OPA_POLICY_BUNDLE):
-        try:
-            if wasmtime and settings.OPA_POLICY_BUNDLE.endswith(".wasm"):
+        if wasmtime and settings.OPA_POLICY_BUNDLE.endswith(".wasm"):
+            async with _wasm_engine_lock:
                 if settings.OPA_POLICY_BUNDLE not in _wasm_engine_cache:
                     _wasm_engine_cache[settings.OPA_POLICY_BUNDLE] = OpaWasmEngine(settings.OPA_POLICY_BUNDLE)
-                engine = _wasm_engine_cache[settings.OPA_POLICY_BUNDLE]
-                
-                # Note: evaluation should ideally happen in a thread pool for true async or fast enough sync
-                # But for benchmarking we just use it directly
+            engine = _wasm_engine_cache[settings.OPA_POLICY_BUNDLE]
 
+            try:
                 result = engine.evaluate(input_data, query)
+            except RuntimeError as e:
+                raise PolicyEvaluationError(f"WASM policy evaluation failed: {e}") from e
+
+            if not result:
+                raise PolicyEvaluationError("WASM returned empty result set")
+            res = result[0].get("result", False)
+            if isinstance(res, bool):
+                return res
+            if isinstance(res, dict):
+                if "allow_state_write" in res:
+                    return res["allow_state_write"]
+                if "allow_reintegration" in res:
+                    return res["allow_reintegration"]
+            return False
                 
-                # Check specific entrypoints since we exported multiple
-                res = result[0].get("result", False)
-                if isinstance(res, bool): return res
-                if "allow_state_write" in res: return res["allow_state_write"]
-                if "allow_reintegration" in res: return res["allow_reintegration"]
-                return False
-                
-            cmd = [str(OPA_BIN), "eval", "-b", settings.OPA_POLICY_BUNDLE, "--stdin-input", query]
-            process = await asyncio.create_subprocess_exec(
-                *cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        cmd = [str(OPA_BIN), "eval", "-b", settings.OPA_POLICY_BUNDLE, "--stdin-input", query]
+        process = await asyncio.create_subprocess_exec(
+            *cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate(input=json.dumps(input_data).encode())
+        if process.returncode != 0:
+            raise PolicyEvaluationError(
+                f"OPA bundle eval failed (exit {process.returncode}): {stderr.decode()[:200]}"
             )
-            stdout, stderr = await process.communicate(input=json.dumps(input_data).encode())
-            if process.returncode == 0:
-                output = json.loads(stdout.decode())
-                return output.get("result", [{}])[0].get("expressions", [{}])[0].get("value", False)
-        except Exception as e:
-            print('WASM ERROR:', e)
-            pass
+        output = json.loads(stdout.decode())
+        return output.get("result", [{}])[0].get("expressions", [{}])[0].get("value", False)
 
     if settings.OPA_URL:
-
         try:
             async with httpx.AsyncClient() as client:
                 res = await client.post(f"{settings.OPA_URL}/v1/data/{policy_package}", json={"input": input_data})
@@ -444,10 +455,12 @@ async def evaluate_opa_policy(policy_package: str, query: str, input_data: dict)
                     result = res.json().get("result", {})
                     if "allow_state_write" in result: return result["allow_state_write"]
                     if "allow_reintegration" in result: return result["allow_reintegration"]
-                return False
+                    return False
+                raise PolicyEvaluationError(f"OPA REST returned {res.status_code}")
+        except PolicyEvaluationError:
+            raise
         except Exception as e:
-            print(f"OPA REST Error: {e}")
-            return False
+            raise PolicyEvaluationError(f"OPA REST unreachable: {e}") from e
             
     # Subprocess fallback
     cmd = [str(OPA_BIN), "eval", "-d", str(POLICIES_DIR), "--stdin-input", query]
@@ -456,11 +469,15 @@ async def evaluate_opa_policy(policy_package: str, query: str, input_data: dict)
     )
     stdout, stderr = await process.communicate(input=json.dumps(input_data).encode())
 
-    if process.returncode != 0: return False
+    if process.returncode != 0:
+        raise PolicyEvaluationError(
+            f"OPA subprocess failed (exit {process.returncode}): {stderr.decode()[:200]}"
+        )
     try:
         output = json.loads(stdout.decode())
         return output.get("result", [{}])[0].get("expressions", [{}])[0].get("value", False)
-    except: return False
+    except (json.JSONDecodeError, IndexError, KeyError) as e:
+        raise PolicyEvaluationError(f"OPA output unparseable: {e}") from e
 
 def _compute_covers_interval_gap(dag, covers):
     if not covers: return []
@@ -577,7 +594,10 @@ async def submit_candidate(request: Request):
     if payload.get("node_type") == "COMPACTION":
         payload["covers_interval_gap"] = await backend.compute_covers_interval_gap(payload.get("covers", []))
 
-    decision = await evaluate_admission(payload, parent_ids, exists_map, quarantined_map, auth_context)
+    try:
+        decision = await evaluate_admission(payload, parent_ids, exists_map, quarantined_map, auth_context)
+    except PolicyEvaluationError as e:
+        raise HTTPException(status_code=503, detail=f"Policy engine unavailable: {e}")
     
     decision_id = str(uuid.uuid4())
     writer_identity = auth_context.get("sub", "unknown")

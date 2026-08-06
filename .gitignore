@@ -1,7 +1,14 @@
 .venv/
+venv/
 __pycache__/
 .pytest_cache/
 *.log
 bin/
 *.json
 !schemas/*.json
+
+# Build artifacts — never beside policy sources
+build/
+*.wasm
+policies/*.tar.gz
+policies/*.wasm
