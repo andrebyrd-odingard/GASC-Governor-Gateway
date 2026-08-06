@@ -148,16 +148,39 @@ def test_rego_quarantine_integrity_fail_monotonicity():
     assert allowed == False
 
 
-def test_policies_directory_compiles_cleanly():
+def test_policies_directory_contains_only_rego():
     """
-    Guard: ensure no build artifacts (tarballs, WASM, compiled bundles) live
-    in policies/ — they cause OPA to fail with 'multiple default rules'.
+    Guard (cheap): policies/ must contain only .rego files.
+    Any other file type (tarballs, WASM, bundles) will cause OPA to fail
+    at runtime with 'multiple default rules' when loaded via `opa eval -d`.
     """
-    cmd = [str(OPA_BIN), "check", str(POLICIES_DIR)]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    non_rego = [
+        f.name for f in POLICIES_DIR.iterdir()
+        if f.is_file() and not f.name.endswith(".rego")
+    ]
+    assert non_rego == [], (
+        f"Non-Rego files found in policies/: {non_rego}\n"
+        f"Build artifacts must not live beside policy sources. "
+        f"Move them to build/ or dist/."
+    )
+
+
+def test_policies_directory_loads_cleanly():
+    """
+    Guard (runtime-identical): run the same invocation the subprocess fallback
+    uses — `opa eval -d policies/` — and assert exit 0.  This catches any
+    issue that causes OPA to reject the directory at load time.
+    """
+    cmd = [
+        str(OPA_BIN), "eval", "-d", str(POLICIES_DIR),
+        "--stdin-input", "data.gasc.governor.integrity.allow_state_write"
+    ]
+    result = subprocess.run(
+        cmd, input="{}", capture_output=True, text=True
+    )
     assert result.returncode == 0, (
-        f"OPA failed to compile policies/ cleanly.\n"
-        f"stderr: {result.stderr}\n"
-        f"This usually means a build artifact (.tar.gz, .wasm) was committed "
-        f"into the policies/ directory."
+        f"OPA failed to load policies/ (exit {result.returncode}).\n"
+        f"stderr: {result.stderr[:500]}\n"
+        f"This is the exact invocation the runtime uses. "
+        f"Check for build artifacts or syntax errors in policies/."
     )

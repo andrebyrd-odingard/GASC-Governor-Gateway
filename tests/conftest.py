@@ -24,6 +24,19 @@ os.environ["DEBUG_MODE"] = "true"
 
 import pytest
 import asyncio
+from pathlib import Path
+
+_OPA_BIN = Path(__file__).parent.parent / "bin" / "opa"
+
+def pytest_collection_modifyitems(config, items):
+    if not _OPA_BIN.exists():
+        skip_opa = pytest.mark.skip(
+            reason="OPA binary not found — run: mkdir -p bin && "
+                   "curl -L -o bin/opa https://openpolicyagent.org/downloads/latest/opa_$(uname -s | tr A-Z a-z)_$(uname -m) && "
+                   "chmod +x bin/opa"
+        )
+        for item in items:
+            item.add_marker(skip_opa)
 
 
 @pytest.fixture(params=["memory", "sqlite"], autouse=True)
