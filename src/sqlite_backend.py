@@ -83,8 +83,20 @@ class SqliteStateBackend(BaseStateBackend):
                 recurrence_class TEXT NOT NULL,
                 detected_at_utc TEXT NOT NULL,
                 signal_source TEXT NOT NULL,
+                outcome TEXT NOT NULL DEFAULT 'PROCESSED',
                 event_json TEXT NOT NULL
             )''')
+
+            await db.execute('''CREATE TABLE IF NOT EXISTS signal_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_source TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                signal_kind TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                recorded_at_utc TEXT NOT NULL
+            )''')
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_signal_attempts_source ON signal_attempts(signal_source, recorded_at_utc)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_signal_attempts_time ON signal_attempts(recorded_at_utc)")
             
             await db.execute('''CREATE TABLE IF NOT EXISTS withdrawal_ledger (
                 node_id TEXT PRIMARY KEY,
@@ -376,6 +388,7 @@ class SqliteStateBackend(BaseStateBackend):
             await db.execute("DELETE FROM recurrence_events")
             await db.execute("DELETE FROM withdrawal_ledger")
             await db.execute("DELETE FROM calibration_runs")
+            await db.execute("DELETE FROM signal_attempts")
             await db.commit()
             
         # Re-initialize basic data
@@ -458,7 +471,42 @@ class SqliteStateBackend(BaseStateBackend):
                 rows = await cursor.fetchall()
                 return [{"run_id": r[0], "run_at_utc": r[1], "seeded_count": r[2], "detected_count": r[3], "sensitivity_floor": r[4], "monitored_period": json.loads(r[5])} for r in rows]
 
+    async def record_signal_attempt(self, signal_source: str, node_id: str,
+                                    signal_kind: str, outcome: str) -> None:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat() + "Z"
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO signal_attempts (signal_source, node_id, signal_kind, outcome, recorded_at_utc) VALUES (?, ?, ?, ?, ?)",
+                (signal_source, node_id, signal_kind, outcome, now)
+            )
+            await db.commit()
 
+    async def count_recent_signals(self, signal_source: str, since_utc: str) -> int:
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM signal_attempts WHERE signal_source = ? AND recorded_at_utc > ?",
+                (signal_source, since_utc)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return row[0]
+
+    async def count_recent_signals_global(self, since_utc: str) -> int:
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM signal_attempts WHERE recorded_at_utc > ?",
+                (since_utc,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return row[0]
+
+    async def get_signal_outcome_counts(self) -> Dict[str, int]:
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT outcome, COUNT(*) FROM signal_attempts GROUP BY outcome"
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return {r[0]: r[1] for r in rows}
 
     async def record_shadow_decision(self, decision_id: str, node_id: str, evaluated_at_utc: str, would_have_blocked: bool, reason: str, parent_status_json: str, policy_bundle_digest: str, writer_identity: str):
         async with self._connect() as db:

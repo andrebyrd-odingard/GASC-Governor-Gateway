@@ -1,6 +1,6 @@
 import asyncio
 import hashlib
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from abc import ABC, abstractmethod
 
 class BaseStateBackend(ABC):
@@ -39,6 +39,16 @@ class BaseStateBackend(ABC):
     @abstractmethod
     async def get_calibration_runs(self) -> List[dict]: pass
     
+
+    @abstractmethod
+    async def record_signal_attempt(self, signal_source: str, node_id: str,
+                                    signal_kind: str, outcome: str) -> None: pass
+    @abstractmethod
+    async def count_recent_signals(self, signal_source: str, since_utc: str) -> int: pass
+    @abstractmethod
+    async def count_recent_signals_global(self, since_utc: str) -> int: pass
+    @abstractmethod
+    async def get_signal_outcome_counts(self) -> Dict[str, int]: pass
 
     @abstractmethod
     async def record_shadow_decision(self, decision_id: str, node_id: str, evaluated_at_utc: str, would_have_blocked: bool, reason: str, parent_status_json: str, policy_bundle_digest: str, writer_identity: str):

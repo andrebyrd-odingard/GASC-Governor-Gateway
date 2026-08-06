@@ -335,25 +335,18 @@ class TestTransitiveWithdrawal:
 
 class TestRecurrenceRateLimits:
     """
-    Are recurrence rate limits in-process?
+    Rate limits are enforced in the backend (§C.1).
 
-    If RECURRENCE_SIGNAL_RATE_LIMIT is enforced in-process, N gateway
-    instances give an attacker N× the signal budget. That's §C.1.
-
-    This test documents the current state and flags the issue.
+    Per-identity handles a compromised credential.
+    Global handles many compromised credentials.
+    Both live in the backend so N gateway instances share one budget.
     """
 
     @pytest.mark.asyncio
-    async def test_rate_limit_is_in_process(self, async_client):
+    async def test_rate_limit_is_enforced(self, async_client):
         """
-        Verify the current implementation: RECURRENCE_SIGNAL_RATE_LIMIT
-        is a setting checked in-process. This test documents that it IS
-        per-instance (the bug §C.1 describes), so we know to fix it when
-        moving to Postgres.
-
-        Currently: rate limits are NOT enforced at all in process_recurrence.
-        The setting exists but no code checks it. This confirms the §C.1
-        risk is real — there's no rate limiting happening.
+        Fire RECURRENCE_SIGNAL_RATE_LIMIT signals, then one more.
+        The (limit+1)th signal must return 429 with Retry-After.
         """
         await async_client.post(
             "/reset-db",
@@ -361,26 +354,291 @@ class TestRecurrenceRateLimits:
         )
 
         original_limit = settings.RECURRENCE_SIGNAL_RATE_LIMIT
-        settings.RECURRENCE_SIGNAL_RATE_LIMIT = 2  # Very low
+        settings.RECURRENCE_SIGNAL_RATE_LIMIT = 3
 
         try:
-            # Build a small graph
             root = create_payload("rate-root", "clean-parent-1")
             resp = await async_client.post("/submit-candidate", json=root)
             assert resp.status_code == 200
 
-            # Fire many recurrence events — more than the limit
-            for i in range(10):
-                await process_recurrence(_backend(), "rate-root", "FUNCTIONAL_FAILURE", f"test-{i}")
+            designator_token = generate_designator_token()
 
-            # Document: currently all 10 fire without rate limiting.
-            # The withdrawal ledger will have "rate-root" from the first call.
-            # Subsequent calls just re-process it (idempotent via INSERT OR IGNORE).
-            # No exception, no 429 — rate limiting is not enforced.
-            # This confirms §C.1: rate limits must move to the backend.
-            withdrawal_ledger = await _backend().get_withdrawal_ledger()
-            # The node should be withdrawn (at least once)
-            assert "rate-root" in withdrawal_ledger
+            # Fire exactly at the limit — all should succeed
+            for i in range(3):
+                resp = await async_client.post(
+                    "/observe",
+                    json={"node_id": "rate-root", "recurrence_class": "FUNCTIONAL_FAILURE",
+                          "detected_at_utc": "2026-10-27T10:00:00Z"},
+                    headers={"Authorization": f"Bearer {designator_token}"}
+                )
+                assert resp.status_code == 200, f"Signal {i} should succeed but got {resp.status_code}"
+
+            # The next one must be rate-limited
+            resp = await async_client.post(
+                "/observe",
+                json={"node_id": "rate-root", "recurrence_class": "FUNCTIONAL_FAILURE",
+                      "detected_at_utc": "2026-10-27T10:00:00Z"},
+                headers={"Authorization": f"Bearer {designator_token}"}
+            )
+            assert resp.status_code == 429, f"Expected 429, got {resp.status_code}"
+            assert "Retry-After" in resp.headers
 
         finally:
             settings.RECURRENCE_SIGNAL_RATE_LIMIT = original_limit
+
+    @pytest.mark.asyncio
+    async def test_rejected_signals_count_toward_limit(self, async_client):
+        """
+        Escalated/rejected signals count toward the rate limit.
+        If only successful signals counted, an attacker aims at nodes
+        that will be refused and the limit is trivially bypassed.
+        """
+        await async_client.post(
+            "/reset-db",
+            headers={"Authorization": f"Bearer {generate_admin_token()}"}
+        )
+
+        original_limit = settings.RECURRENCE_SIGNAL_RATE_LIMIT
+        original_amp = settings.MAX_WITHDRAWAL_AMPLIFICATION
+        settings.RECURRENCE_SIGNAL_RATE_LIMIT = 3
+        settings.MAX_WITHDRAWAL_AMPLIFICATION = 1  # Force escalation on everything
+
+        try:
+            # Build a graph that will exceed amplification (2 nodes > limit of 1)
+            root = create_payload("rej-root", "clean-parent-1")
+            await async_client.post("/submit-candidate", json=root)
+            child = create_payload("rej-child", "rej-root")
+            await async_client.post("/submit-candidate", json=child)
+
+            designator_token = generate_designator_token()
+
+            # Fire 3 signals — all will escalate (not process) because amplification is 1
+            for i in range(3):
+                resp = await async_client.post(
+                    "/observe",
+                    json={"node_id": "rej-root", "recurrence_class": "FUNCTIONAL_FAILURE",
+                          "detected_at_utc": "2026-10-27T10:00:00Z"},
+                    headers={"Authorization": f"Bearer {designator_token}"}
+                )
+                assert resp.status_code == 200
+
+            # 4th signal must be rate-limited even though prior ones escalated
+            resp = await async_client.post(
+                "/observe",
+                json={"node_id": "rej-root", "recurrence_class": "FUNCTIONAL_FAILURE",
+                      "detected_at_utc": "2026-10-27T10:00:00Z"},
+                headers={"Authorization": f"Bearer {designator_token}"}
+            )
+            assert resp.status_code == 429
+
+        finally:
+            settings.RECURRENCE_SIGNAL_RATE_LIMIT = original_limit
+            settings.MAX_WITHDRAWAL_AMPLIFICATION = original_amp
+
+    @pytest.mark.asyncio
+    async def test_global_limit_trips_independently(self, async_client):
+        """
+        The global limit fires even when no single identity hits its own limit.
+        Many compromised credentials each firing below their per-identity budget
+        still get blocked once the global budget is exhausted.
+        """
+        await async_client.post(
+            "/reset-db",
+            headers={"Authorization": f"Bearer {generate_admin_token()}"}
+        )
+
+        original_per = settings.RECURRENCE_SIGNAL_RATE_LIMIT
+        original_global = settings.RECURRENCE_SIGNAL_GLOBAL_LIMIT
+        settings.RECURRENCE_SIGNAL_RATE_LIMIT = 100  # High per-identity
+        settings.RECURRENCE_SIGNAL_GLOBAL_LIMIT = 4   # Low global
+
+        try:
+            root = create_payload("glob-root", "clean-parent-1")
+            await async_client.post("/submit-candidate", json=root)
+
+            # Use 4 different identity tokens, 1 signal each
+            for i in range(4):
+                token = jwt.encode(
+                    {"sub": f"attacker-{i}", "role": "designator"},
+                    JWT_PRIVATE_KEY_PEM, algorithm="ES256"
+                )
+                resp = await async_client.post(
+                    "/observe",
+                    json={"node_id": "glob-root", "recurrence_class": "FUNCTIONAL_FAILURE",
+                          "detected_at_utc": "2026-10-27T10:00:00Z"},
+                    headers={"Authorization": f"Bearer {token}"}
+                )
+                assert resp.status_code == 200, f"Signal from attacker-{i} should succeed"
+
+            # 5th signal from a new identity — global limit exhausted
+            token = jwt.encode(
+                {"sub": "attacker-4", "role": "designator"},
+                JWT_PRIVATE_KEY_PEM, algorithm="ES256"
+            )
+            resp = await async_client.post(
+                "/observe",
+                json={"node_id": "glob-root", "recurrence_class": "FUNCTIONAL_FAILURE",
+                      "detected_at_utc": "2026-10-27T10:00:00Z"},
+                headers={"Authorization": f"Bearer {token}"}
+            )
+            assert resp.status_code == 429
+
+        finally:
+            settings.RECURRENCE_SIGNAL_RATE_LIMIT = original_per
+            settings.RECURRENCE_SIGNAL_GLOBAL_LIMIT = original_global
+
+    @pytest.mark.asyncio
+    async def test_designate_rate_limit(self, async_client):
+        """
+        /designate enforces DESIGNATION_RATE_LIMIT. Same CDoS-0006 attack
+        in its original form — strategic false designation as availability attack.
+        """
+        await async_client.post(
+            "/reset-db",
+            headers={"Authorization": f"Bearer {generate_admin_token()}"}
+        )
+
+        original_limit = settings.DESIGNATION_RATE_LIMIT
+        settings.DESIGNATION_RATE_LIMIT = 2
+
+        try:
+            # Create nodes to designate
+            for i in range(4):
+                p = create_payload(f"des-node-{i}", "clean-parent-1")
+                await async_client.post("/submit-candidate", json=p)
+
+            designator_token = generate_designator_token()
+
+            # First 2 designations succeed
+            for i in range(2):
+                resp = await async_client.post(
+                    "/designate",
+                    json={"poisoned_node_id": f"des-node-{i}",
+                          "detected_at_utc": "2026-10-27T10:00:00Z",
+                          "source": "human_report", "confidence_score": 0.9,
+                          "reason": "test"},
+                    headers={"Authorization": f"Bearer {designator_token}"}
+                )
+                assert resp.status_code == 200, f"Designation {i} should succeed"
+
+            # 3rd designation is rate-limited
+            resp = await async_client.post(
+                "/designate",
+                json={"poisoned_node_id": "des-node-2",
+                      "detected_at_utc": "2026-10-27T10:00:00Z",
+                      "source": "human_report", "confidence_score": 0.9,
+                      "reason": "test"},
+                headers={"Authorization": f"Bearer {designator_token}"}
+            )
+            assert resp.status_code == 429
+            assert "Retry-After" in resp.headers
+
+        finally:
+            settings.DESIGNATION_RATE_LIMIT = original_limit
+
+    @pytest.mark.asyncio
+    async def test_rate_limited_signals_in_report(self, async_client):
+        """
+        Rate-limited signals appear in /recurrence-report as their own count.
+        A silent limit is indistinguishable from a quiet system.
+        """
+        await async_client.post(
+            "/reset-db",
+            headers={"Authorization": f"Bearer {generate_admin_token()}"}
+        )
+
+        original_limit = settings.RECURRENCE_SIGNAL_RATE_LIMIT
+        settings.RECURRENCE_SIGNAL_RATE_LIMIT = 1
+
+        try:
+            root = create_payload("report-root", "clean-parent-1")
+            await async_client.post("/submit-candidate", json=root)
+
+            designator_token = generate_designator_token()
+
+            # 1 succeeds, 1 gets rate-limited
+            await async_client.post(
+                "/observe",
+                json={"node_id": "report-root", "recurrence_class": "FUNCTIONAL_FAILURE",
+                      "detected_at_utc": "2026-10-27T10:00:00Z"},
+                headers={"Authorization": f"Bearer {designator_token}"}
+            )
+            await async_client.post(
+                "/observe",
+                json={"node_id": "report-root", "recurrence_class": "FUNCTIONAL_FAILURE",
+                      "detected_at_utc": "2026-10-27T10:00:00Z"},
+                headers={"Authorization": f"Bearer {designator_token}"}
+            )
+
+            # Check report
+            admin_token = generate_admin_token()
+            resp = await async_client.get(
+                "/recurrence-report",
+                headers={"Authorization": f"Bearer {admin_token}"}
+            )
+            assert resp.status_code == 200
+            report = resp.json()
+            outcome_counts = report["signal_outcome_counts"]
+            assert "RATE_LIMITED" in outcome_counts
+            assert outcome_counts["RATE_LIMITED"] >= 1
+
+        finally:
+            settings.RECURRENCE_SIGNAL_RATE_LIMIT = original_limit
+
+    @pytest.mark.slow
+    @pytest.mark.asyncio
+    async def test_window_rolls(self, async_client):
+        """
+        After the horizon passes, the identity can signal again.
+        We simulate this by setting a very short horizon.
+        """
+        await async_client.post(
+            "/reset-db",
+            headers={"Authorization": f"Bearer {generate_admin_token()}"}
+        )
+
+        original_limit = settings.RECURRENCE_SIGNAL_RATE_LIMIT
+        original_horizon = settings.CONTINUATION_HORIZON_SECONDS
+        settings.RECURRENCE_SIGNAL_RATE_LIMIT = 1
+        settings.CONTINUATION_HORIZON_SECONDS = 1  # 1 second window
+
+        try:
+            root = create_payload("window-root", "clean-parent-1")
+            await async_client.post("/submit-candidate", json=root)
+
+            designator_token = generate_designator_token()
+
+            # First signal succeeds
+            resp = await async_client.post(
+                "/observe",
+                json={"node_id": "window-root", "recurrence_class": "FUNCTIONAL_FAILURE",
+                      "detected_at_utc": "2026-10-27T10:00:00Z"},
+                headers={"Authorization": f"Bearer {designator_token}"}
+            )
+            assert resp.status_code == 200
+
+            # Immediate second is rate-limited
+            resp = await async_client.post(
+                "/observe",
+                json={"node_id": "window-root", "recurrence_class": "FUNCTIONAL_FAILURE",
+                      "detected_at_utc": "2026-10-27T10:00:00Z"},
+                headers={"Authorization": f"Bearer {designator_token}"}
+            )
+            assert resp.status_code == 429
+
+            # Wait for window to roll
+            import time
+            time.sleep(1.1)
+
+            # Now it should succeed again
+            resp = await async_client.post(
+                "/observe",
+                json={"node_id": "window-root", "recurrence_class": "FUNCTIONAL_FAILURE",
+                      "detected_at_utc": "2026-10-27T10:00:00Z"},
+                headers={"Authorization": f"Bearer {designator_token}"}
+            )
+            assert resp.status_code == 200
+
+        finally:
+            settings.RECURRENCE_SIGNAL_RATE_LIMIT = original_limit
+            settings.CONTINUATION_HORIZON_SECONDS = original_horizon

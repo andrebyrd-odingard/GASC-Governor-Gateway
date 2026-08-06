@@ -129,6 +129,16 @@ class BaseStateBackend(ABC):
     @abstractmethod
     async def reset(self): pass
 
+    @abstractmethod
+    async def record_signal_attempt(self, signal_source: str, node_id: str,
+                                    signal_kind: str, outcome: str) -> None: pass
+    @abstractmethod
+    async def count_recent_signals(self, signal_source: str, since_utc: str) -> int: pass
+    @abstractmethod
+    async def count_recent_signals_global(self, since_utc: str) -> int: pass
+    @abstractmethod
+    async def get_signal_outcome_counts(self) -> Dict[str, int]: pass
+
 class MemoryStateBackend(BaseStateBackend):
     def __init__(self):
         self.lock = asyncio.Lock()
@@ -146,6 +156,7 @@ class MemoryStateBackend(BaseStateBackend):
         self._recurrence_events = []
         self._withdrawal_ledger = {}
         self._calibration_runs = []
+        self._signal_attempts = []
         
     async def get_dag(self) -> Dict[str, Any]:
         async with self.lock: return self.dag.copy()
@@ -380,7 +391,37 @@ class MemoryStateBackend(BaseStateBackend):
             if not hasattr(self, '_calibration_runs'):
                 return []
             return list(self._calibration_runs)
-    
+
+    async def record_signal_attempt(self, signal_source: str, node_id: str,
+                                    signal_kind: str, outcome: str) -> None:
+        async with self.lock:
+            self._signal_attempts.append({
+                "signal_source": signal_source,
+                "node_id": node_id,
+                "signal_kind": signal_kind,
+                "outcome": outcome,
+                "recorded_at_utc": datetime.now(timezone.utc).isoformat() + "Z"
+            })
+
+    async def count_recent_signals(self, signal_source: str, since_utc: str) -> int:
+        async with self.lock:
+            return sum(
+                1 for a in self._signal_attempts
+                if a["signal_source"] == signal_source and a["recorded_at_utc"] >= since_utc
+            )
+
+    async def count_recent_signals_global(self, since_utc: str) -> int:
+        async with self.lock:
+            return sum(1 for a in self._signal_attempts if a["recorded_at_utc"] >= since_utc)
+
+    async def get_signal_outcome_counts(self) -> Dict[str, int]:
+        async with self.lock:
+            counts: Dict[str, int] = {}
+            for a in self._signal_attempts:
+                outcome = a["outcome"]
+                counts[outcome] = counts.get(outcome, 0) + 1
+            return counts
+
     async def record_shadow_decision(self, decision_id: str, node_id: str, evaluated_at_utc: str, would_have_blocked: bool, reason: str, parent_status_json: str, policy_bundle_digest: str, writer_identity: str):
         async with self.lock:
             self.shadow_decisions.append({"would_have_blocked": would_have_blocked})
@@ -907,6 +948,23 @@ async def declare_checkpoint(event: CheckpointEvent, request: Request):
 @app.post("/designate")
 async def designate_poison(event: DesignationEvent, request: Request):
     claims = verify_role_jwt(request, "designator")
+    designator_identity = claims.get("sub", "unknown")
+
+    # --- Rate limiting for /designate (CDoS-0006 defense) ---
+    from datetime import timedelta
+    horizon_start = (datetime.now(timezone.utc) - timedelta(seconds=settings.CONTINUATION_HORIZON_SECONDS)).isoformat() + "Z"
+
+    per_identity_count = await backend.count_recent_signals(designator_identity, horizon_start)
+    if per_identity_count >= settings.DESIGNATION_RATE_LIMIT:
+        await backend.record_signal_attempt(designator_identity, event.poisoned_node_id, "designation", "RATE_LIMITED")
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded for designations",
+            headers={"Retry-After": str(settings.CONTINUATION_HORIZON_SECONDS)}
+        )
+
+    # Record the attempt BEFORE processing
+    await backend.record_signal_attempt(designator_identity, event.poisoned_node_id, "designation", "PENDING")
 
     # --- Exclusive lock (Phase 2 Part A) ---
     # Designation takes the EXCLUSIVE admission lock. This blocks all concurrent
@@ -938,7 +996,7 @@ async def designate_poison(event: DesignationEvent, request: Request):
             "poisoned_root_id": event.poisoned_node_id,
             "computed_blast_radius_C_p": c_p,
             "monotonic_ledger_digest_post_transition": monotonic_ledger_digest,
-            "designator_identity": claims.get("sub"),
+            "designator_identity": designator_identity,
             "designation_reason": event.reason
         }
         await backend.apply_quarantine_transaction(q_event, c_p)
@@ -1047,18 +1105,46 @@ async def designate_poison(event: DesignationEvent, request: Request):
 @app.post("/observe")
 async def observe_recurrence(event: ObserveEvent, request: Request):
     claims = verify_role_jwt(request, "designator")
-    
+    signal_source = claims.get("sub", "unknown")
+
     if event.recurrence_class not in ["FUNCTIONAL_FAILURE", "VERIFIER_CONTRADICTION"]:
         raise HTTPException(status_code=400, detail="Invalid recurrence class")
-        
+
+    # --- Rate limiting (§C.1): count the attempt, not the outcome ---
+    from datetime import timedelta
+    horizon_start = (datetime.now(timezone.utc) - timedelta(seconds=settings.CONTINUATION_HORIZON_SECONDS)).isoformat() + "Z"
+
+    per_identity_count = await backend.count_recent_signals(signal_source, horizon_start)
+    if per_identity_count >= settings.RECURRENCE_SIGNAL_RATE_LIMIT:
+        await backend.record_signal_attempt(signal_source, event.node_id, "recurrence", "RATE_LIMITED")
+        retry_after = settings.CONTINUATION_HORIZON_SECONDS
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded for recurrence signals",
+            headers={"Retry-After": str(retry_after)}
+        )
+
+    global_count = await backend.count_recent_signals_global(horizon_start)
+    if global_count >= settings.RECURRENCE_SIGNAL_GLOBAL_LIMIT:
+        await backend.record_signal_attempt(signal_source, event.node_id, "recurrence", "RATE_LIMITED")
+        retry_after = settings.CONTINUATION_HORIZON_SECONDS
+        raise HTTPException(
+            status_code=429,
+            detail="Global rate limit exceeded for recurrence signals",
+            headers={"Retry-After": str(retry_after)}
+        )
+
+    # Record the attempt BEFORE processing — rejected/escalated signals count
+    await backend.record_signal_attempt(signal_source, event.node_id, "recurrence", "PENDING")
+
     if event.recurrence_class == "VERIFIER_CONTRADICTION":
         if not event.adapter_signature:
             raise HTTPException(status_code=403, detail="adapter_signature required for VERIFIER_CONTRADICTION")
-            
+
         adapter_key = settings.RECOVERY_ADAPTER_PUBLIC_KEY
         if not adapter_key:
             raise HTTPException(status_code=500, detail="RECOVERY_ADAPTER_PUBLIC_KEY not configured")
-            
+
         try:
             from ecdsa import VerifyingKey, NIST256p
             vk = VerifyingKey.from_string(bytes.fromhex(adapter_key), curve=NIST256p)
@@ -1066,9 +1152,9 @@ async def observe_recurrence(event: ObserveEvent, request: Request):
                 raise HTTPException(status_code=403, detail="Invalid adapter signature")
         except Exception:
             raise HTTPException(status_code=403, detail="Invalid adapter signature")
-            
+
     from src.r6_utils import process_recurrence
-    await process_recurrence(backend, event.node_id, event.recurrence_class, claims.get("sub"), event.evidence)
+    await process_recurrence(backend, event.node_id, event.recurrence_class, signal_source, event.evidence)
     return {"status": "success"}
 
 @app.post("/renew-trust")
@@ -1098,7 +1184,8 @@ async def get_recurrence_report(request: Request):
     return {
         "active_horizons": await backend.get_active_horizon_set(),
         "expired_horizons": await backend.get_expired_horizon_set(),
-        "withdrawal_ledger": await backend.get_withdrawal_ledger()
+        "withdrawal_ledger": await backend.get_withdrawal_ledger(),
+        "signal_outcome_counts": await backend.get_signal_outcome_counts()
     }
 
 @app.get("/shadow-report")

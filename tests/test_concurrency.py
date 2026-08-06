@@ -24,6 +24,8 @@ from ecdsa import SigningKey, NIST256p
 from tests.conftest import JWT_PRIVATE_KEY_PEM
 from src.governor_service import app, settings
 
+pytestmark = pytest.mark.slow
+
 sk = SigningKey.generate(curve=NIST256p)
 PUBLIC_KEY_HEX = sk.verifying_key.to_string().hex()
 
