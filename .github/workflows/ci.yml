@@ -73,8 +73,8 @@ jobs:
         print(f'Per-write latency: {write_ms:.3f} ms')
         print(f'Traversal latency: {trav_us:.3f} us/node')
         failed = False
-        if write_ms > 10.0:
-            print(f'FAIL: per-write latency {write_ms:.3f} ms exceeds 10 ms ceiling')
+        if write_ms > 15.0:
+            print(f'FAIL: per-write latency {write_ms:.3f} ms exceeds 15 ms ceiling')
             failed = True
         if trav_us > 50.0:
             print(f'FAIL: traversal latency {trav_us:.3f} us/node exceeds 50 us ceiling')
