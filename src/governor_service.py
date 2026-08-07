@@ -521,6 +521,31 @@ class _AdmissionLock:
 
 _admission_lock = _AdmissionLock()
 
+
+@asynccontextmanager
+async def _admission_shared():
+    """Acquire the shared admission lock.
+
+    In-process _AdmissionLock provides single-instance concurrency control.
+    For multi-instance Postgres deployments, callers should additionally use
+    backend.advisory_shared() at the deployment layer (load balancer / sidecar).
+    """
+    async with _admission_lock.shared():
+        yield
+
+
+@asynccontextmanager
+async def _admission_exclusive():
+    """Acquire the exclusive admission lock.
+
+    In-process _AdmissionLock provides single-instance concurrency control.
+    For multi-instance Postgres deployments, callers should additionally use
+    backend.advisory_exclusive() at the deployment layer (load balancer / sidecar).
+    """
+    async with _admission_lock.exclusive():
+        yield
+
+
 app = FastAPI()
 
 @app.on_event("startup")
@@ -780,7 +805,7 @@ async def submit_candidate(request: Request):
     # The shared lock ensures no /designate can quarantine a parent between
     # the taint check and the commit. Policy evaluation is inside the lock;
     # with WASM this is sub-100µs. See §A.3 for the subprocess warning.
-    async with _admission_lock.shared():
+    async with _admission_shared():
         exists_map, quarantined_map = await asyncio.gather(
             backend.nodes_exist(parent_ids),
             backend.are_quarantined(parent_ids),
@@ -935,7 +960,7 @@ async def declare_context_compacted(event: ContextCompactedEvent, request: Reque
         raise HTTPException(status_code=401, detail="Cryptographic signature verification failed")
 
     # Shared lock: /context-compacted is a commit path, same as /submit-candidate.
-    async with _admission_lock.shared():
+    async with _admission_shared():
         await backend.commit_node(payload)
     return {"status": "success", "message": "Compaction node committed to DAG."}
 
@@ -973,7 +998,7 @@ async def designate_poison(event: DesignationEvent, request: Request):
     # Designation takes the EXCLUSIVE admission lock. This blocks all concurrent
     # admissions until the quarantine ledger is updated, closing the phantom race.
     # Designations are rare; contention is negligible by construction.
-    async with _admission_lock.exclusive():
+    async with _admission_exclusive():
         exists_map, quarantined_map = await asyncio.gather(
             backend.nodes_exist([event.poisoned_node_id]),
             backend.are_quarantined([event.poisoned_node_id]),
@@ -1089,7 +1114,9 @@ async def designate_poison(event: DesignationEvent, request: Request):
                 # R5 Reintegration Gate (Simplified, in real system this is an OPA call)
                 # But we just admit it directly since the Rego checks happen in submit-candidate usually,
                 # actually we should commit it to the DAG.
-                await backend.commit_node(candidate)
+                # Shared lock: reintegration is a commit path.
+                async with _admission_shared():
+                    await backend.commit_node(candidate)
                 await backend.record_reintegration(candidate.get("payload_id"), comp_node, settings.CONTINUATION_HORIZON_SECONDS)
                 rc_data["disposition"] = "REDUCIBLE"
                 rc_data["reconstructed_node_id"] = candidate.get("payload_id")

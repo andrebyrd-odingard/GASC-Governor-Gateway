@@ -2,11 +2,19 @@ import asyncio
 import asyncpg
 import json
 import hashlib
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List
 
 from src.governor_service import BaseStateBackend
 from src.config import settings
+
+# Stable namespace hash for advisory locks.
+# All admission/designation paths share one lock key.
+_ADVISORY_LOCK_KEY = int.from_bytes(
+    hashlib.sha256(b"gasc-governor-admission").digest()[:8],
+    byteorder="big", signed=True
+)
 
 
 def _parse_utc(ts: str) -> datetime:
@@ -56,7 +64,7 @@ class PostgresStateBackend(BaseStateBackend):
             self._pool = None
         if self._pool is None:
             self._pool = await asyncpg.create_pool(
-                self.dsn, min_size=2, max_size=10,
+                self.dsn, min_size=1, max_size=10,
                 init=self._setup_connection
             )
             self._pool_loop = current_loop
@@ -66,6 +74,52 @@ class PostgresStateBackend(BaseStateBackend):
         if self._pool is not None:
             await self._pool.close()
             self._pool = None
+
+    @asynccontextmanager
+    async def advisory_shared(self):
+        """Acquire a shared advisory lock (admission paths).
+
+        Multiple shared holders run concurrently; an exclusive holder
+        (designation) waits for all shared holders to release.
+        Uses session-level locks so inner operations can use separate connections.
+        """
+        pool = await self._get_pool()
+        conn = await pool.acquire()
+        try:
+            await conn.execute(
+                "SELECT pg_advisory_lock_shared($1)", _ADVISORY_LOCK_KEY
+            )
+            try:
+                yield
+            finally:
+                await conn.execute(
+                    "SELECT pg_advisory_unlock_shared($1)", _ADVISORY_LOCK_KEY
+                )
+        finally:
+            await pool.release(conn)
+
+    @asynccontextmanager
+    async def advisory_exclusive(self):
+        """Acquire an exclusive advisory lock (designation paths).
+
+        Blocks until all shared holders release. Only one exclusive
+        holder at a time. Uses session-level locks so inner operations
+        can use separate connections.
+        """
+        pool = await self._get_pool()
+        conn = await pool.acquire()
+        try:
+            await conn.execute(
+                "SELECT pg_advisory_lock($1)", _ADVISORY_LOCK_KEY
+            )
+            try:
+                yield
+            finally:
+                await conn.execute(
+                    "SELECT pg_advisory_unlock($1)", _ADVISORY_LOCK_KEY
+                )
+        finally:
+            await pool.release(conn)
 
     async def init_db(self):
         pool = await self._get_pool()

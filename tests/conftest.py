@@ -80,14 +80,12 @@ def backend_setup(request, monkeypatch, tmp_path):
             _init_pg()
 
         def _teardown():
-            async def _close():
-                await test_backend.close()
-            try:
-                asyncio.run(_close())
-            except Exception:
-                if test_backend._pool is not None:
+            if test_backend._pool is not None:
+                try:
                     test_backend._pool.terminate()
-                    test_backend._pool = None
+                except Exception:
+                    pass
+                test_backend._pool = None
         request.addfinalizer(_teardown)
     else:
         from src.sqlite_backend import SqliteStateBackend
