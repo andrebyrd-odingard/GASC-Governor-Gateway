@@ -9,6 +9,22 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: gasc
+          POSTGRES_PASSWORD: gasc_test
+          POSTGRES_DB: gasc_test
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          -c max_connections=200
+
     steps:
     - uses: actions/checkout@v4
 
@@ -31,6 +47,8 @@ jobs:
         chmod +x bin/opa
 
     - name: Run Python Tests
+      env:
+        POSTGRES_TEST_DSN: postgresql://gasc:gasc_test@localhost:5433/gasc_test?sslmode=disable
       run: |
         pytest tests/
 

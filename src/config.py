@@ -31,4 +31,7 @@ class Settings(BaseSettings):
     MAX_IN_FLIGHT_REQUESTS: int = 100
     GRACEFUL_DRAIN_TIMEOUT_SECONDS: float = 30.0
 
+    # Benchmark / CI gate (can be overridden via BENCHMARK_P99_50_MS env var)
+    BENCHMARK_P99_50_MS: float = 500.0
+
 settings = Settings()
