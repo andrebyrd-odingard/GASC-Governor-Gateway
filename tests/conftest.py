@@ -111,6 +111,11 @@ def backend_setup(request, monkeypatch, tmp_path):
     # Reset the admission lock for each test to avoid event-loop binding issues
     from src.governor_service import _AdmissionLock
     monkeypatch.setattr(src.governor_service, "_admission_lock", _AdmissionLock())
+    # Reset readiness/drain state so tests that use a bare TestClient(app)
+    # (which does not trigger lifespan) start from a known-good state.
+    src.governor_service._ready = True
+    src.governor_service._drain_event.clear()
+    src.governor_service._in_flight = 0
 
 from src.config import settings
 settings.ENFORCEMENT_MODE = 'enforce'

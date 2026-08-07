@@ -923,6 +923,9 @@ async def submit_candidate(request: Request):
         try:
             decision = await evaluate_admission(payload, parent_ids, exists_map, quarantined_map, auth_context)
         except PolicyEvaluationError as e:
+            # FAIL-CLOSED: If the policy engine cannot be reached or fails to
+            # produce a decision, the write is NEVER admitted. A policy failure
+            # is an availability condition, not an authorization one, so 503.
             raise HTTPException(status_code=503, detail=f"Policy engine unavailable: {e}")
 
         decision_id = str(uuid.uuid4())
