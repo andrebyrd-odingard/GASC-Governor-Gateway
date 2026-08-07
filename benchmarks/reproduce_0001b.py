@@ -142,7 +142,12 @@ async def run_trial(trial_idx):
     annot_latency_per_node = ((t_annot_end - t_annot_start) * 1_000_000) / len(c_p) if c_p else 0 # microseconds
 
     db_size = os.path.getsize(DB_PATH)
-    
+
+    # Close the backend connection before we delete the database in the next trial.
+    if backend._db is not None:
+        await backend._db.close()
+        backend._db = None
+
     return {
         "commitment_ms": np.median(commit_latencies),
         "record_insert_ms": np.median(record_insert_latencies),
