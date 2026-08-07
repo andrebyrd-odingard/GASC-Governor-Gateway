@@ -26,4 +26,9 @@ class Settings(BaseSettings):
     DESIGNATION_RATE_LIMIT: int = 20
     TRUST_RENEWAL_REQUIRED: bool = True
 
+    # Readiness / Backpressure Settings
+    READINESS_PROBE_PATH: str = "/ready"
+    MAX_IN_FLIGHT_REQUESTS: int = 100
+    GRACEFUL_DRAIN_TIMEOUT_SECONDS: float = 30.0
+
 settings = Settings()

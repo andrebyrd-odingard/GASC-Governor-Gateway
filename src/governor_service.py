@@ -8,6 +8,7 @@ from jsonschema import validate
 from pathlib import Path
 from datetime import datetime, timezone
 import uuid
+import time
 import hashlib
 import httpx
 import jwt
@@ -519,6 +520,81 @@ class _AdmissionLock:
                 self._write_requested = False
 
 
+# --- Readiness, drain, and backpressure (Phase 2C) ---
+_drain_event = asyncio.Event()
+_in_flight = 0
+_in_flight_lock = asyncio.Lock()
+_ready = True
+
+
+async def _acquire_in_flight(path: str):
+    """Backpressure: reject requests when in-flight count exceeds threshold.
+
+    The /ready probe is always admitted so it can report its own status.
+    Returns (status_code, detail) if the request should be rejected, otherwise None.
+    """
+    global _in_flight
+    if path == "/ready":
+        return None
+    # Middleware only enforces explicit drain/backpressure.  Readiness itself
+    # is exposed by the /ready endpoint; this keeps tests that use a
+    # bare TestClient(app) (which does not trigger lifespan) from failing.
+    if _drain_event.is_set():
+        return 503, "Service is shutting down"
+
+    async with _in_flight_lock:
+        if _in_flight >= settings.MAX_IN_FLIGHT_REQUESTS:
+            return 429, "Too many in-flight requests"
+        _in_flight += 1
+    return None
+
+
+async def _release_in_flight(path: str):
+    global _in_flight
+    if path == "/ready":
+        return
+    async with _in_flight_lock:
+        _in_flight = max(0, _in_flight - 1)
+
+
+class BackpressureMiddleware:
+    """ASGI middleware that tracks in-flight requests and enforces backpressure."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        reject = await _acquire_in_flight(path)
+        if reject:
+            status, detail = reject
+            await self._send_json_response(send, status, detail, "1")
+            return
+
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            await _release_in_flight(path)
+
+    @staticmethod
+    async def _send_json_response(send, status: int, detail: str, retry_after: str):
+        body = json.dumps({"detail": detail}).encode("utf-8")
+        await send({
+            "type": "http.response.start",
+            "status": status,
+            "headers": [
+                [b"content-type", b"application/json"],
+                [b"Retry-After", retry_after.encode("utf-8")],
+                [b"content-length", str(len(body)).encode("utf-8")],
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+
 _admission_lock = _AdmissionLock()
 
 
@@ -547,12 +623,17 @@ async def _admission_exclusive():
 
 
 app = FastAPI()
+app.add_middleware(BackpressureMiddleware)
 
 @app.on_event("startup")
 async def startup_event():
+    global _ready
     if hasattr(backend, "init_db"):
         await backend.init_db()
-        
+
+    _ready = True
+    _drain_event.clear()
+
     if settings.ENFORCEMENT_MODE == "shadow":
         if settings.SHADOW_BANNER:
             print("===========================================================")
@@ -571,6 +652,31 @@ async def startup_event():
             "call (~14ms p50, 1s tail). WASM bundle (OPA_POLICY_BUNDLE=*.wasm) is "
             "required for production concurrency."
         )
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Graceful drain: stop accepting new work and wait for in-flight requests."""
+    global _ready
+    _ready = False
+    _drain_event.set()
+
+    deadline = time.monotonic() + settings.GRACEFUL_DRAIN_TIMEOUT_SECONDS
+    while _in_flight > 0 and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+
+    if hasattr(backend, "close"):
+        await backend.close()
+
+
+@app.get("/ready")
+async def ready_probe(request: Request):
+    """Readiness probe: 200 when the service is initialized, 503 otherwise."""
+    if not _ready:
+        raise HTTPException(status_code=503, detail="Not ready")
+    if _drain_event.is_set():
+        raise HTTPException(status_code=503, detail="Shutting down")
+    return {"status": "ready"}
 
 
 # --- Security Checks ---
