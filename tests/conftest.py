@@ -39,10 +39,56 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip_opa)
 
 
-@pytest.fixture(params=["memory", "sqlite"], autouse=True)
+_POSTGRES_TEST_DSN = os.environ.get("POSTGRES_TEST_DSN", "")
+
+def _backend_params():
+    params = ["memory", "sqlite"]
+    if _POSTGRES_TEST_DSN:
+        params.append("postgres")
+    return params
+
+
+@pytest.fixture(params=_backend_params(), autouse=True)
 def backend_setup(request, monkeypatch, tmp_path):
     if request.param == "memory":
-        from src.governor_service import MemoryStateBackend; test_backend = MemoryStateBackend()
+        from src.governor_service import MemoryStateBackend
+        test_backend = MemoryStateBackend()
+    elif request.param == "postgres":
+        from src.postgres_backend import PostgresStateBackend
+        test_backend = PostgresStateBackend(dsn=_POSTGRES_TEST_DSN)
+
+        async def _init_and_reset():
+            await test_backend.init_db()
+            await test_backend.reset()
+            await test_backend.close()
+
+        def _init_pg():
+            asyncio.run(_init_and_reset())
+            test_backend._pool = None
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            import threading
+            t = threading.Thread(target=_init_pg)
+            t.start()
+            t.join()
+        else:
+            _init_pg()
+
+        def _teardown():
+            async def _close():
+                await test_backend.close()
+            try:
+                asyncio.run(_close())
+            except Exception:
+                if test_backend._pool is not None:
+                    test_backend._pool.terminate()
+                    test_backend._pool = None
+        request.addfinalizer(_teardown)
     else:
         from src.sqlite_backend import SqliteStateBackend
         db_path = str(tmp_path / "test_state.db")
@@ -61,7 +107,7 @@ def backend_setup(request, monkeypatch, tmp_path):
             t.join()
         else:
             asyncio.run(test_backend.init_db())
-            
+
     import src.governor_service
     monkeypatch.setattr(src.governor_service, "backend", test_backend)
     # Reset the admission lock for each test to avoid event-loop binding issues

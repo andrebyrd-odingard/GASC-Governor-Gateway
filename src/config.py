@@ -3,7 +3,8 @@ import os
 from typing import Optional
 
 class Settings(BaseSettings):
-    BACKEND_TYPE: str = "memory"
+    BACKEND_TYPE: str = "memory"  # "memory" | "sqlite" | "postgres"
+    POSTGRES_DSN: str = ""
     MAX_TRAVERSAL_DEPTH: int = 1000
     OPA_URL: str | None = None # e.g. http://localhost:8181
     JWT_PUBLIC_KEY: str

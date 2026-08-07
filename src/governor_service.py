@@ -447,7 +447,10 @@ class MemoryStateBackend(BaseStateBackend):
             return hashlib.sha256(json.dumps(merged, sort_keys=True).encode()).hexdigest()
 
 
-if settings.BACKEND_TYPE == "sqlite":
+if settings.BACKEND_TYPE == "postgres":
+    from src.postgres_backend import PostgresStateBackend
+    backend = PostgresStateBackend()
+elif settings.BACKEND_TYPE == "sqlite":
     from src.sqlite_backend import SqliteStateBackend
     backend = SqliteStateBackend()
 else:
@@ -1192,7 +1195,12 @@ async def get_recurrence_report(request: Request):
 async def get_shadow_report(request: Request):
     verify_role_jwt(request, "admin")
     
-    if hasattr(backend, "_connect"):
+    if hasattr(backend, "_get_pool"):
+        pool = await backend._get_pool()
+        async with pool.acquire() as conn:
+            total = await conn.fetchval("SELECT COUNT(*) FROM shadow_decisions")
+            blocked = await conn.fetchval("SELECT COUNT(*) FROM shadow_decisions WHERE would_have_blocked = true")
+    elif hasattr(backend, "_connect"):
         async with backend._connect() as db:
             async with db.execute("SELECT COUNT(*) FROM shadow_decisions") as cursor:
                 total = (await cursor.fetchone())[0]

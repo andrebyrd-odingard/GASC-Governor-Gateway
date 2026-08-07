@@ -11,6 +11,8 @@ pydantic-settings==2.14.2
 respx
 litellm>=1.0.0
 aiosqlite>=0.20.0
+asyncpg>=0.29.0
+alembic>=1.13.0
 numpy
 pytest-asyncio
 wasmtime>=23.0.0
