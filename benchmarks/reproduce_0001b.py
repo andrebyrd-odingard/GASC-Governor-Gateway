@@ -59,6 +59,8 @@ async def run_trial(trial_idx):
     import aiosqlite
     async with aiosqlite.connect(DB_PATH) as db:
         # Pre-insert root
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA synchronous=NORMAL")
         await db.execute("INSERT OR IGNORE INTO nodes (node_id, payload_json, content_hash, commitment) VALUES (?, ?, ?, ?)", 
                          ("root", "{}", "", ""))
         await db.commit()
@@ -186,7 +188,7 @@ async def main():
         "cpu": platform.processor(),
         "python_version": platform.python_version(),
         "sqlite_version": sqlite3.sqlite_version,
-        "pragmas": {"journal_mode": "WAL", "synchronous": "FULL"}
+        "pragmas": {"journal_mode": "WAL", "synchronous": "NORMAL"}
     }
     
     # Write JSON
