@@ -3,8 +3,8 @@ import json
 import subprocess
 import asyncio
 from contextlib import asynccontextmanager
-import jsonschema
-from jsonschema import validate
+from functools import lru_cache
+from jsonschema import Draft202012Validator, ValidationError
 from pathlib import Path
 from datetime import datetime, timezone
 import uuid
@@ -13,15 +13,15 @@ import hashlib
 import httpx
 import jwt
 import os
-import json
-from ecdsa import VerifyingKey, NIST256p
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+from cryptography.exceptions import InvalidSignature
 from pydantic_settings import BaseSettings
 from typing import Dict, List, Any
 from abc import ABC, abstractmethod
 from pydantic import BaseModel
 from enum import Enum
-import subprocess
-import asyncio
 
 try:
     import wasmtime
@@ -40,6 +40,8 @@ OPA_BIN = ROOT_DIR / "bin" / "opa"
 
 with open(SCHEMAS_DIR / "state_write_payload.json", "r") as f:
     PAYLOAD_SCHEMA = json.load(f)
+
+PAYLOAD_SCHEMA_VALIDATOR = Draft202012Validator(PAYLOAD_SCHEMA)
 
 # --- Designation Models ---
 class DesignationSource(str, Enum):
@@ -703,23 +705,54 @@ def verify_role_jwt(request: Request, required_role: str) -> dict:
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Unauthorized: {str(e)}")
 
+def _load_public_key(public_key_hex: str) -> ec.EllipticCurvePublicKey:
+    raw = bytes.fromhex(public_key_hex)
+    if len(raw) == 64:
+        # Raw uncompressed point (x || y), as produced by ecdsa NIST256p
+        x = int.from_bytes(raw[:32], "big")
+        y = int.from_bytes(raw[32:], "big")
+        return ec.EllipticCurvePublicNumbers(x, y, ec.SECP256R1()).public_key()
+    if len(raw) == 65 and raw[0] == 0x04:
+        # Uncompressed point with SECG prefix
+        return ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), raw)
+    raise ValueError(f"invalid public key length: {len(raw)}")
+
+
+def _raw_signature_to_der(signature_hex: str) -> bytes:
+    """Convert ecdsa-style 64-byte raw (r||s) signature to DER."""
+    raw = bytes.fromhex(signature_hex)
+    if len(raw) == 64:
+        # ecdsa NIST256p default sigencode_string: 32-byte r || 32-byte s
+        r = int.from_bytes(raw[:32], "big")
+        s = int.from_bytes(raw[32:], "big")
+        return encode_dss_signature(r, s)
+    if raw.startswith(b"\x30"):
+        # Already DER encoded
+        return raw
+    raise ValueError(f"invalid signature length: {len(raw)}")
+
+
 def verify_cryptographic_signature(payload: dict) -> bool:
     if "agent_signature" not in payload or not payload["agent_signature"]:
         return False
-        
+
     content_str = json.dumps(payload.get("state_content", {}), sort_keys=True)
     actual_hash = hashlib.sha256(content_str.encode()).hexdigest()
-    
+
     if actual_hash != payload.get("content_digest_sha256"):
         return False
-        
+
     public_key_hex = payload.get("ephemeral_nhi", {}).get("identity_id")
     signature_hex = payload.get("agent_signature")
-    
+
     try:
-        vk = VerifyingKey.from_string(bytes.fromhex(public_key_hex), curve=NIST256p)
-        return vk.verify(bytes.fromhex(signature_hex), actual_hash.encode())
-    except Exception as e:
+        public_key = _load_public_key(public_key_hex)
+        der_sig = _raw_signature_to_der(signature_hex)
+        # Existing ecdsa signatures were produced with the library's default
+        # hash function (SHA-1).  Retain that for verification compatibility.
+        public_key.verify(der_sig, actual_hash.encode(), ec.ECDSA(hashes.SHA1()))
+        return True
+    except Exception:
         return False
 
 _wasm_engine_cache = {}
@@ -892,8 +925,8 @@ async def submit_candidate(request: Request):
         raise HTTPException(status_code=400, detail="Invalid JSON format")
         
     try:
-        validate(instance=payload, schema=PAYLOAD_SCHEMA)
-    except jsonschema.exceptions.ValidationError as e:
+        PAYLOAD_SCHEMA_VALIDATOR.validate(payload)
+    except ValidationError as e:
         raise HTTPException(status_code=400, detail=f"Schema validation failed: {e.message}")
         
     token = payload.get("ephemeral_nhi", {}).get("session_token")
@@ -911,6 +944,17 @@ async def submit_candidate(request: Request):
     # The shared lock ensures no /designate can quarantine a parent between
     # the taint check and the commit. Policy evaluation is inside the lock;
     # with WASM this is sub-100µs. See §A.3 for the subprocess warning.
+    #
+    # Audit writes (record_shadow_decision) are intentionally kept outside the
+    # critical section; they do not affect admission atomicity and are the
+    # bulk of the lock hold time in the happy path.
+    decision_id = str(uuid.uuid4())
+    writer_identity = auth_context.get("sub", "unknown")
+    decision = None
+    parent_status_json = None
+    is_new = None
+    tainted_event = None
+
     async with _admission_shared():
         exists_map, quarantined_map = await asyncio.gather(
             backend.nodes_exist(parent_ids),
@@ -928,39 +972,13 @@ async def submit_candidate(request: Request):
             # is an availability condition, not an authorization one, so 503.
             raise HTTPException(status_code=503, detail=f"Policy engine unavailable: {e}")
 
-        decision_id = str(uuid.uuid4())
-        writer_identity = auth_context.get("sub", "unknown")
         parent_status_json = json.dumps([{"parent_node_id": pid, "exists": exists_map.get(pid, False), "quarantined": quarantined_map.get(pid, False)} for pid in parent_ids])
 
         if settings.ENFORCEMENT_MODE == "shadow":
             # Idempotency: if commit returns False, this is a duplicate — skip audit
             is_new = await backend.commit_node(payload)
-            if is_new:
-                await backend.record_shadow_decision(
-                    decision_id=decision_id,
-                    node_id=payload.get("payload_id"),
-                    evaluated_at_utc=datetime.now(timezone.utc).isoformat() + "Z",
-                    would_have_blocked=not decision["admit"],
-                    reason=decision.get("reason", ""),
-                    parent_status_json=parent_status_json,
-                    policy_bundle_digest=settings.OPA_POLICY_BUNDLE or "none",
-                    writer_identity=writer_identity
-                )
-            # Shadow mode: always admit unless invalid signature/schema (which we already threw for)
-            return {"status": "success", "message": "State node committed to DAG (Shadow Mode)."}
         else:
             if not decision["admit"]:
-                await backend.record_shadow_decision(
-                    decision_id=decision_id,
-                    node_id=payload.get("payload_id"),
-                    evaluated_at_utc=datetime.now(timezone.utc).isoformat() + "Z",
-                    would_have_blocked=True,
-                    reason=decision.get("reason", ""),
-                    parent_status_json=parent_status_json,
-                    policy_bundle_digest=settings.OPA_POLICY_BUNDLE or "none",
-                    writer_identity=writer_identity
-                )
-
                 if decision.get("reason") == "TAINTED_PARENT":
                     poisoned_root = decision["poisoned_root"]
                     # Deliberate: commit the rejected payload so it appears in the
@@ -980,32 +998,65 @@ async def submit_candidate(request: Request):
                     new_quarantined = [payload.get("payload_id")]
                     monotonic_ledger_digest = await backend.compute_quarantine_digest(c_p + new_quarantined)
 
-                    event = {
+                    tainted_event = {
                         "quarantine_event_id": str(uuid.uuid4()),
                         "detected_at_utc": datetime.now(timezone.utc).isoformat() + "Z",
                         "poisoned_root_id": poisoned_root,
                         "computed_blast_radius_C_p": c_p,
                         "monotonic_ledger_digest_post_transition": monotonic_ledger_digest
                     }
-                    await backend.apply_quarantine_transaction(event, new_quarantined)
-                    raise HTTPException(status_code=403, detail={"error": "TAINTED_PARENT", "event": event})
-                else:
-                    raise HTTPException(status_code=403 if decision.get("reason") == "Verification Separation Policy Failed" else 400, detail=decision.get("reason", "Policy Failed"))
+                    await backend.apply_quarantine_transaction(tainted_event, new_quarantined)
+                # other non-admit cases do not commit; audit is handled outside
+            else:
+                # Idempotency: if commit returns False, this is a duplicate — skip audit
+                is_new = await backend.commit_node(payload)
 
-            # Idempotency: if commit returns False, this is a duplicate — skip audit
-            is_new = await backend.commit_node(payload)
-            if is_new:
-                await backend.record_shadow_decision(
-                    decision_id=decision_id,
-                    node_id=payload.get("payload_id"),
-                    evaluated_at_utc=datetime.now(timezone.utc).isoformat() + "Z",
-                    would_have_blocked=False,
-                    reason="",
-                    parent_status_json=parent_status_json,
-                    policy_bundle_digest=settings.OPA_POLICY_BUNDLE or "none",
-                    writer_identity=writer_identity
-                )
-            return {"status": "success", "message": "State node committed to DAG."}
+    # Shadow / audit writes happen outside the admission lock.  They must still
+    # complete before the response is returned, but they do not extend the
+    # critical section.
+    if settings.ENFORCEMENT_MODE == "shadow":
+        if is_new:
+            await backend.record_shadow_decision(
+                decision_id=decision_id,
+                node_id=payload.get("payload_id"),
+                evaluated_at_utc=datetime.now(timezone.utc).isoformat() + "Z",
+                would_have_blocked=not decision["admit"],
+                reason=decision.get("reason", ""),
+                parent_status_json=parent_status_json,
+                policy_bundle_digest=settings.OPA_POLICY_BUNDLE or "none",
+                writer_identity=writer_identity
+            )
+        return {"status": "success", "message": "State node committed to DAG (Shadow Mode)."}
+    else:
+        if not decision["admit"]:
+            await backend.record_shadow_decision(
+                decision_id=decision_id,
+                node_id=payload.get("payload_id"),
+                evaluated_at_utc=datetime.now(timezone.utc).isoformat() + "Z",
+                would_have_blocked=True,
+                reason=decision.get("reason", ""),
+                parent_status_json=parent_status_json,
+                policy_bundle_digest=settings.OPA_POLICY_BUNDLE or "none",
+                writer_identity=writer_identity
+            )
+
+            if tainted_event:
+                raise HTTPException(status_code=403, detail={"error": "TAINTED_PARENT", "event": tainted_event})
+            else:
+                raise HTTPException(status_code=403 if decision.get("reason") == "Verification Separation Policy Failed" else 400, detail=decision.get("reason", "Policy Failed"))
+
+        if is_new:
+            await backend.record_shadow_decision(
+                decision_id=decision_id,
+                node_id=payload.get("payload_id"),
+                evaluated_at_utc=datetime.now(timezone.utc).isoformat() + "Z",
+                would_have_blocked=False,
+                reason="",
+                parent_status_json=parent_status_json,
+                policy_bundle_digest=settings.OPA_POLICY_BUNDLE or "none",
+                writer_identity=writer_identity
+            )
+        return {"status": "success", "message": "State node committed to DAG."}
 
 @app.post("/declare-external-effect")
 
@@ -1285,10 +1336,9 @@ async def observe_recurrence(event: ObserveEvent, request: Request):
             raise HTTPException(status_code=500, detail="RECOVERY_ADAPTER_PUBLIC_KEY not configured")
 
         try:
-            from ecdsa import VerifyingKey, NIST256p
-            vk = VerifyingKey.from_string(bytes.fromhex(adapter_key), curve=NIST256p)
-            if not vk.verify(bytes.fromhex(event.adapter_signature), event.node_id.encode()):
-                raise HTTPException(status_code=403, detail="Invalid adapter signature")
+            public_key = _load_public_key(adapter_key)
+            der_sig = _raw_signature_to_der(event.adapter_signature)
+            public_key.verify(der_sig, event.node_id.encode(), ec.ECDSA(hashes.SHA1()))
         except Exception:
             raise HTTPException(status_code=403, detail="Invalid adapter signature")
 
