@@ -87,28 +87,18 @@ jobs:
     - name: Score Gateway with GASC-Audit
       run: |
         pip install git+https://github.com/andrebyrd-odingard/gasc-audit.git
+        python -m gasc_audit --artifacts . > gasc_audit_report.json
+        cat gasc_audit_report.json
         python -c "
         import json, sys
-        from gasc_audit_engine import generate_conformance_report
-        report = generate_conformance_report()
-        print(report)
-
-        # Parse the report for the overall result.  The audit engine returns a
-        # text report; we look for the key pass/fail line.
-        lower = report.lower()
-        if 'overall_audit_passed: true' in lower:
-            result = True
-        elif 'overall_audit_passed: false' in lower:
-            result = False
-        else:
-            # If we can't determine, fail safe
-            print('WARNING: could not parse audit result, treating as informational')
-            sys.exit(0)
-
-        # The gateway is expected to self-attest as NOT passing when auditing
-        # its own artifacts (by design).  Fail the gate only if the result
-        # changes unexpectedly — i.e. a 'true' would mean the rubric is broken.
-        if result:
+        with open('gasc_audit_report.json') as f:
+            report = json.load(f)
+        summary = report['conformance_summary']
+        if summary['rule_3_compliance_breached']:
+            print('FAIL: rule 3 compliance breached')
+            sys.exit(1)
+        overall = summary['overall_audit_passed']
+        if overall:
             print('FAIL: overall_audit_passed flipped to true — rubric may be broken')
             sys.exit(1)
         print('PASS: audit scored as expected (overall_audit_passed: false)')
