@@ -23,11 +23,15 @@ def generate_designator_token():
 def generate_generic_token():
     return jwt.encode({"sub": "user", "role": "user"}, JWT_PRIVATE_KEY_PEM, algorithm="ES256")
 
+def content_hash_of(state_content):
+    """Compute the content_digest_sha256 for a given state_content dict."""
+    return hashlib.sha256(json.dumps(state_content, sort_keys=True).encode()).hexdigest()
+
 @pytest.fixture(autouse=True)
 def reset_db():
     client.post("/reset-db", headers={"Authorization": f"Bearer {generate_admin_token()}"})
 
-def create_payload(payload_id, parent_id, state_content, is_compaction=False):
+def create_payload(payload_id, parent_id, state_content, is_compaction=False, parent_content_hash=None):
     session_token = jwt.encode(
         {
             "sub": PUBLIC_KEY_HEX, 
@@ -59,7 +63,7 @@ def create_payload(payload_id, parent_id, state_content, is_compaction=False):
         },
         "parent_dependency_commitments": [{
             "parent_node_id": parent_id,
-            "parent_content_hash": "e" * 64
+            "parent_content_hash": parent_content_hash or "e" * 64
         }],
         "state_content": state_content,
         "content_digest_sha256": actual_hash,
@@ -76,21 +80,24 @@ def create_payload(payload_id, parent_id, state_content, is_compaction=False):
 
 def test_compaction_edge_fail_closed_routing():
     # 1. Standard node-a
-    p1 = create_payload("node-a", "clean-parent-1", {"data": "raw data"})
+    node_a_content = {"data": "raw data"}
+    p1 = create_payload("node-a", "clean-parent-1", node_a_content)
     assert client.post("/submit-candidate", json=p1).status_code == 200
     
     # 2. Compaction node summarizing node-a
-    p2 = create_payload("compaction-1", "node-a", {"data": "summarized"}, is_compaction=True)
+    comp_content = {"data": "summarized"}
+    p2 = create_payload("compaction-1", "node-a", comp_content, is_compaction=True, parent_content_hash=content_hash_of(node_a_content))
     p2["covers"] = ["clean-parent-1", "node-a"]
     p2["summarizer"] = {"method_id": "llm-v1"}
     assert client.post("/submit-candidate", json=p2).status_code == 200
     
     # 3. Downstream node building on the summary (1 hop past compaction)
-    p3 = create_payload("node-b", "compaction-1", {"data": "post-compaction action"})
+    node_b_content = {"data": "post-compaction action"}
+    p3 = create_payload("node-b", "compaction-1", node_b_content, parent_content_hash=content_hash_of(comp_content))
     assert client.post("/submit-candidate", json=p3).status_code == 200
 
     # 4. Another downstream node building on node-b (2 hops past compaction)
-    p4 = create_payload("node-c", "node-b", {"data": "2nd-hop-action"})
+    p4 = create_payload("node-c", "node-b", {"data": "2nd-hop-action"}, parent_content_hash=content_hash_of(node_b_content))
     assert client.post("/submit-candidate", json=p4).status_code == 200
     
     # 5. Designate the upstream node-a as poisoned
@@ -182,17 +189,20 @@ def test_designate_idempotency():
 
 def test_covers_interval_gap_computation():
     # Chain: node-1 -> node-2 -> node-3
-    p1 = create_payload("node-1", "clean-parent-1", {"data": "1"})
+    c1 = {"data": "1"}
+    p1 = create_payload("node-1", "clean-parent-1", c1)
     assert client.post("/submit-candidate", json=p1).status_code == 200
     
-    p2 = create_payload("node-2", "node-1", {"data": "2"})
+    c2 = {"data": "2"}
+    p2 = create_payload("node-2", "node-1", c2, parent_content_hash=content_hash_of(c1))
     assert client.post("/submit-candidate", json=p2).status_code == 200
     
-    p3 = create_payload("node-3", "node-2", {"data": "3"})
+    c3 = {"data": "3"}
+    p3 = create_payload("node-3", "node-2", c3, parent_content_hash=content_hash_of(c2))
     assert client.post("/submit-candidate", json=p3).status_code == 200
     
     # Compaction covering node-1 and node-3, omitting node-2
-    p4 = create_payload("compaction-gap", "node-3", {"data": "summary"}, is_compaction=True)
+    p4 = create_payload("compaction-gap", "node-3", {"data": "summary"}, is_compaction=True, parent_content_hash=content_hash_of(c3))
     p4["covers"] = ["node-1", "node-3"]
     assert client.post("/submit-candidate", json=p4).status_code == 200
     
@@ -217,10 +227,11 @@ def test_checkpoint_api_auth():
 
 def test_reconstruction_failure_paths():
     # Setup chain: node-1 -> comp
-    p1 = create_payload("node-1", "clean-parent-1", {"data": "1"})
+    c1 = {"data": "1"}
+    p1 = create_payload("node-1", "clean-parent-1", c1)
     assert client.post("/submit-candidate", json=p1).status_code == 200
     
-    comp = create_payload("comp-fail", "node-1", {"data": "summary"}, is_compaction=True)
+    comp = create_payload("comp-fail", "node-1", {"data": "summary"}, is_compaction=True, parent_content_hash=content_hash_of(c1))
     comp["covers"] = ["clean-parent-1", "node-1"]
     comp["summarizer"] = {"method_id": "llm-v1"}
     assert client.post("/submit-candidate", json=comp).status_code == 200
@@ -242,12 +253,14 @@ def test_reconstruction_failure_paths():
 def test_reconstruction_success_path():
     # Setup chain: clean-root -> clean-child -> comp
     # Poison clean-root. clean-child is in frontier.
-    p0 = create_payload("clean-root", "clean-parent-1", {"data": "0"})
+    c0 = {"data": "0"}
+    p0 = create_payload("clean-root", "clean-parent-1", c0)
     client.post("/submit-candidate", json=p0)
-    p1 = create_payload("clean-child", "clean-root", {"data": "1"})
+    c1 = {"data": "1"}
+    p1 = create_payload("clean-child", "clean-root", c1, parent_content_hash=content_hash_of(c0))
     client.post("/submit-candidate", json=p1)
     
-    comp = create_payload("comp-succ", "clean-child", {"data": "sum"}, is_compaction=True)
+    comp = create_payload("comp-succ", "clean-child", {"data": "sum"}, is_compaction=True, parent_content_hash=content_hash_of(c1))
     comp["covers"] = ["clean-root", "clean-child"]
     comp["summarizer"] = {"method_id": "llm-v1"}
     client.post("/submit-candidate", json=comp)

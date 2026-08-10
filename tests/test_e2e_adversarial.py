@@ -30,7 +30,10 @@ def generate_designator_token():
 def reset_db():
     client.post("/reset-db", headers={"Authorization": f"Bearer {generate_admin_token()}"})
 
-def create_payload(payload_id, parent_id, state_content):
+def content_hash_of(state_content):
+    return hashlib.sha256(json.dumps(state_content, sort_keys=True).encode()).hexdigest()
+
+def create_payload(payload_id, parent_id, state_content, parent_content_hash=None):
     session_token = jwt.encode(
         {
             "sub": PUBLIC_KEY_HEX, 
@@ -62,7 +65,7 @@ def create_payload(payload_id, parent_id, state_content):
         },
         "parent_dependency_commitments": [{
             "parent_node_id": parent_id,
-            "parent_content_hash": "e" * 64
+            "parent_content_hash": parent_content_hash or "e" * 64
         }],
         "state_content": state_content,
         "content_digest_sha256": actual_hash,
@@ -71,10 +74,11 @@ def create_payload(payload_id, parent_id, state_content):
 
 def test_e2e_adversarial_injection_via_designate():
     # 1. Establish normal DAG state
-    payload_1 = create_payload("order-1", "clean-parent-1", {"item": "laptop"})
+    c1 = {"item": "laptop"}
+    payload_1 = create_payload("order-1", "clean-parent-1", c1)
     assert client.post("/submit-candidate", json=payload_1).status_code == 200
     
-    payload_2 = create_payload("order-2", "order-1", {"item": "mouse"})
+    payload_2 = create_payload("order-2", "order-1", {"item": "mouse"}, parent_content_hash=content_hash_of(c1))
     assert client.post("/submit-candidate", json=payload_2).status_code == 200
 
     # 2. Assume node "order-1" is discovered to be tainted by an out-of-band intrusion detection (e.g. AMG)
@@ -95,7 +99,7 @@ def test_e2e_adversarial_injection_via_designate():
     assert "order-2" in event_data["computed_blast_radius_C_p"]
 
     # 3. Agent blindly builds on order-2 (which descends from quarantined order-1)
-    payload_3 = create_payload("order-3", "order-2", {"item": "keyboard"})
+    payload_3 = create_payload("order-3", "order-2", {"item": "keyboard"}, parent_content_hash=content_hash_of({"item": "mouse"}))
     response = client.post("/submit-candidate", json=payload_3)
     
     # 4. Gateway must intercept via Transitive Taint Propagation (admission-time block)

@@ -233,6 +233,23 @@ class PostgresStateBackend(BaseStateBackend):
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_shadow_blocked ON shadow_decisions(would_have_blocked)")
 
+            await conn.execute('''CREATE TABLE IF NOT EXISTS reintegration_evidence (
+                node_id TEXT PRIMARY KEY,
+                pre_state_digest TEXT NOT NULL,
+                post_state_digest TEXT NOT NULL,
+                gate_evidence_json JSONB NOT NULL,
+                recorded_at_utc TIMESTAMPTZ NOT NULL
+            )''')
+
+            await conn.execute('''CREATE TABLE IF NOT EXISTS continuity_exposures (
+                exposure_id TEXT PRIMARY KEY,
+                node_id TEXT NOT NULL,
+                substitute_status TEXT NOT NULL,
+                exposed_at_utc TIMESTAMPTZ NOT NULL,
+                quarantine_non_empty BOOLEAN NOT NULL DEFAULT FALSE,
+                exposure_record_json JSONB NOT NULL
+            )''')
+
     # ---- DAG ----
 
     async def get_dag(self) -> Dict[str, Any]:
@@ -246,7 +263,7 @@ class PostgresStateBackend(BaseStateBackend):
         content_hash = payload.get("content_digest_sha256", "")
         parents = payload.get("parent_dependency_commitments", [])
 
-        sorted_deps = sorted([p["parent_node_id"] for p in parents])
+        sorted_deps = sorted([p["parent_node_id"] + ":" + p.get("parent_content_hash", "") for p in parents])
         commitment_input = content_hash + "".join(sorted_deps)
         commitment = hashlib.sha256(commitment_input.encode()).hexdigest()
 
@@ -280,6 +297,18 @@ class PostgresStateBackend(BaseStateBackend):
             )
             found = {r["node_id"] for r in rows}
         return {nid: (nid in found) for nid in uniq}
+
+    async def get_node_content_hashes(self, node_ids: List[str]) -> Dict[str, str]:
+        """Return {node_id: content_hash} for existing nodes."""
+        if not node_ids:
+            return {}
+        uniq = list(dict.fromkeys(node_ids))
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT node_id, content_hash FROM nodes WHERE node_id = ANY($1)", uniq
+            )
+        return {r["node_id"]: r["content_hash"] for r in rows}
 
     async def are_quarantined(self, node_ids: List[str]) -> Dict[str, bool]:
         if not node_ids:
@@ -500,6 +529,46 @@ class PostgresStateBackend(BaseStateBackend):
                 "SELECT 1 FROM external_effects WHERE node_id = ANY($1) LIMIT 1", node_ids
             )
             return row is not None
+
+    # ---- Reintegration evidence (REQ-007) ----
+
+    async def record_reintegration_evidence(self, node_id: str, pre_digest: str, post_digest: str, gate_evidence: list):
+        """Record pre/post state digests and gate execution evidence for REQ-007."""
+        now = datetime.now(timezone.utc)
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO reintegration_evidence (node_id, pre_state_digest, post_state_digest, gate_evidence_json, recorded_at_utc) "
+                "VALUES ($1, $2, $3, $4, $5) ON CONFLICT (node_id) DO UPDATE SET "
+                "pre_state_digest=$2, post_state_digest=$3, gate_evidence_json=$4, recorded_at_utc=$5",
+                node_id, pre_digest, post_digest, json.dumps(gate_evidence), now
+            )
+
+    async def compute_state_digest(self) -> str:
+        """Compute a digest of the current DAG + quarantine state for transition records."""
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            nodes = await conn.fetch("SELECT node_id, commitment FROM nodes ORDER BY node_id")
+            q_nodes = await conn.fetch("SELECT node_id FROM quarantine_ledger ORDER BY node_id")
+        combined = json.dumps({"nodes": [(r["node_id"], r["commitment"]) for r in nodes], "quarantine": [r["node_id"] for r in q_nodes]}, sort_keys=True)
+        return hashlib.sha256(combined.encode()).hexdigest()
+
+    async def record_continuity_exposure(self, exposure_id: str, node_id: str, substitute_status: str, quarantine_non_empty: bool, exposure_record: dict):
+        """Record a continuity exposure event for REQ-004."""
+        now = datetime.now(timezone.utc)
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO continuity_exposures (exposure_id, node_id, substitute_status, exposed_at_utc, quarantine_non_empty, exposure_record_json) "
+                "VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+                exposure_id, node_id, substitute_status, now, quarantine_non_empty, json.dumps(exposure_record)
+            )
+
+    async def get_continuity_exposures(self) -> List[dict]:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT exposure_id, node_id, substitute_status, exposed_at_utc, quarantine_non_empty, exposure_record_json FROM continuity_exposures ORDER BY exposed_at_utc")
+            return [{"exposure_id": r["exposure_id"], "node_id": r["node_id"], "substitute_status": r["substitute_status"], "exposed_at_utc": r["exposed_at_utc"].isoformat() + "Z", "quarantine_non_empty": r["quarantine_non_empty"], "exposure_record": r["exposure_record_json"]} for r in rows]
 
     # ---- Reintegration horizon ----
 
@@ -740,6 +809,7 @@ class PostgresStateBackend(BaseStateBackend):
                 await conn.execute("DELETE FROM calibration_runs")
                 await conn.execute("DELETE FROM signal_attempts")
                 await conn.execute("DELETE FROM shadow_decisions")
+                await conn.execute("DELETE FROM continuity_exposures")
 
         await self.commit_node({"payload_id": "clean-parent-1", "parent_dependency_commitments": []})
         pool = await self._get_pool()

@@ -130,6 +130,23 @@ class SqliteStateBackend(BaseStateBackend):
             
             await db.execute("CREATE INDEX IF NOT EXISTS idx_shadow_evaluated ON shadow_decisions(evaluated_at_utc)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_shadow_blocked ON shadow_decisions(would_have_blocked)")
+
+            await db.execute('''CREATE TABLE IF NOT EXISTS reintegration_evidence (
+                node_id TEXT PRIMARY KEY,
+                pre_state_digest TEXT NOT NULL,
+                post_state_digest TEXT NOT NULL,
+                gate_evidence_json TEXT NOT NULL,
+                recorded_at_utc TEXT NOT NULL
+            )''')
+            
+            await db.execute('''CREATE TABLE IF NOT EXISTS continuity_exposures (
+                exposure_id TEXT PRIMARY KEY,
+                node_id TEXT NOT NULL,
+                substitute_status TEXT NOT NULL,
+                exposed_at_utc TEXT NOT NULL,
+                quarantine_non_empty INTEGER NOT NULL DEFAULT 0,
+                exposure_record_json TEXT NOT NULL
+            )''')
             
             await db.commit()
 
@@ -168,8 +185,8 @@ class SqliteStateBackend(BaseStateBackend):
         content_hash = payload.get("content_digest_sha256", "")
         parents = payload.get("parent_dependency_commitments", [])
         
-        # Commitment logic: SHA-256(contentHash || sorted(deps))
-        sorted_deps = sorted([p["parent_node_id"] for p in parents])
+        # Commitment logic: SHA-256(contentHash || sorted(node_id:content_hash pairs))
+        sorted_deps = sorted([p["parent_node_id"] + ":" + p.get("parent_content_hash", "") for p in parents])
         commitment_input = content_hash + "".join(sorted_deps)
         commitment = hashlib.sha256(commitment_input.encode()).hexdigest()
         
@@ -470,6 +487,7 @@ class SqliteStateBackend(BaseStateBackend):
             await db.execute("DELETE FROM withdrawal_ledger")
             await db.execute("DELETE FROM calibration_runs")
             await db.execute("DELETE FROM signal_attempts")
+            await db.execute("DELETE FROM continuity_exposures")
             await db.commit()
             
         # Re-initialize basic data
@@ -486,6 +504,17 @@ class SqliteStateBackend(BaseStateBackend):
             await db.execute(
                 "INSERT OR REPLACE INTO reintegration_horizon (node_id, admitted_at_utc, trust_expires_utc, predecessor_id) VALUES (?, ?, ?, ?)",
                 (node_id, now.isoformat() + "Z", expires.isoformat() + "Z", predecessor_id)
+            )
+            await db.commit()
+
+    async def record_reintegration_evidence(self, node_id: str, pre_digest: str, post_digest: str, gate_evidence: list):
+        """Record pre/post state digests and gate execution evidence for REQ-007."""
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat() + "Z"
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO reintegration_evidence (node_id, pre_state_digest, post_state_digest, gate_evidence_json, recorded_at_utc) VALUES (?, ?, ?, ?, ?)",
+                (node_id, pre_digest, post_digest, json.dumps(gate_evidence), now)
             )
             await db.commit()
 
@@ -608,6 +637,17 @@ class SqliteStateBackend(BaseStateBackend):
                 found = {r[0] for r in await cur.fetchall()}
         return {nid: (nid in found) for nid in uniq}
 
+    async def get_node_content_hashes(self, node_ids: List[str]) -> Dict[str, str]:
+        """Return {node_id: content_hash} for existing nodes."""
+        if not node_ids:
+            return {}
+        uniq = list(dict.fromkeys(node_ids))
+        q = f"SELECT node_id, content_hash FROM nodes WHERE node_id IN ({','.join('?' * len(uniq))})"
+        async with self._connect() as db:
+            async with db.execute(q, uniq) as cur:
+                rows = await cur.fetchall()
+        return {r[0]: r[1] for r in rows}
+
     async def are_quarantined(self, node_ids: List[str]) -> Dict[str, bool]:
         if not node_ids:
             return {}
@@ -626,6 +666,33 @@ class SqliteStateBackend(BaseStateBackend):
                 existing = {row[0] for row in rows}
             merged = sorted(existing | set(additional_node_ids))
             return hashlib.sha256(json.dumps(merged, sort_keys=True).encode()).hexdigest()
+
+    async def compute_state_digest(self) -> str:
+        """Compute a digest of the current DAG + quarantine state for transition records."""
+        async with self._connect() as db:
+            async with db.execute("SELECT node_id, commitment FROM nodes ORDER BY node_id") as cursor:
+                nodes = await cursor.fetchall()
+            async with db.execute("SELECT node_id FROM quarantine_ledger ORDER BY node_id") as cursor:
+                q_nodes = await cursor.fetchall()
+        combined = json.dumps({"nodes": [(r[0], r[1]) for r in nodes], "quarantine": [r[0] for r in q_nodes]}, sort_keys=True)
+        return hashlib.sha256(combined.encode()).hexdigest()
+
+    async def record_continuity_exposure(self, exposure_id: str, node_id: str, substitute_status: str, quarantine_non_empty: bool, exposure_record: dict):
+        """Record a continuity exposure event for REQ-004."""
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat() + "Z"
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO continuity_exposures (exposure_id, node_id, substitute_status, exposed_at_utc, quarantine_non_empty, exposure_record_json) VALUES (?, ?, ?, ?, ?, ?)",
+                (exposure_id, node_id, substitute_status, now, 1 if quarantine_non_empty else 0, json.dumps(exposure_record))
+            )
+            await db.commit()
+
+    async def get_continuity_exposures(self) -> List[dict]:
+        async with self._connect() as db:
+            async with db.execute("SELECT exposure_id, node_id, substitute_status, exposed_at_utc, quarantine_non_empty, exposure_record_json FROM continuity_exposures ORDER BY exposed_at_utc") as cursor:
+                rows = await cursor.fetchall()
+                return [{"exposure_id": r[0], "node_id": r[1], "substitute_status": r[2], "exposed_at_utc": r[3], "quarantine_non_empty": bool(r[4]), "exposure_record": json.loads(r[5])} for r in rows]
 
     async def compute_covers_interval_gap(self, covers: List[str]) -> List[str]:
         if not covers: return []
