@@ -11,9 +11,11 @@ wasm:
 		-e 'gasc/governor/verification/allow_reintegration' \
 		-o build/bundle.tar.gz \
 		policies/
-	@tar xzf build/bundle.tar.gz -C build policy.wasm
-	@rm -f build/bundle.tar.gz
-	@echo "Built build/policy.wasm ($(shell wc -c < build/policy.wasm) bytes)"
+	@tar xzf build/bundle.tar.gz -C build
+	@rm -f build/bundle.tar.gz build/data.json build/.manifest
+	@rm -rf build/policies
+	@ls build/policy.wasm >/dev/null
+	@echo "Built build/policy.wasm ($$(wc -c < build/policy.wasm | tr -d ' ') bytes)"
 
 # Run full test suite with WASM bundle
 test: wasm

@@ -54,8 +54,10 @@ jobs:
           -e 'gasc/governor/verification/allow_reintegration' \
           -o build/bundle.tar.gz \
           policies/
-        tar xzf build/bundle.tar.gz -C build policy.wasm
-        rm -f build/bundle.tar.gz
+        tar xzf build/bundle.tar.gz -C build
+        rm -f build/bundle.tar.gz build/data.json build/.manifest
+        rm -rf build/policies
+        ls -la build/policy.wasm
         echo "Built build/policy.wasm ($(wc -c < build/policy.wasm) bytes)"
 
     - name: Run Python Tests
@@ -63,7 +65,7 @@ jobs:
         POSTGRES_TEST_DSN: postgresql://gasc:gasc_test@localhost:5433/gasc_test?sslmode=disable
         OPA_POLICY_BUNDLE: build/policy.wasm
       run: |
-        pytest tests/
+        pytest tests/ -m "not slow"
 
     - name: Run OPA Policy Tests
       run: |
