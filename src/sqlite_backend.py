@@ -147,6 +147,25 @@ class SqliteStateBackend(BaseStateBackend):
                 quarantine_non_empty INTEGER NOT NULL DEFAULT 0,
                 exposure_record_json TEXT NOT NULL
             )''')
+
+            await db.execute('''CREATE TABLE IF NOT EXISTS substitute_declarations (
+                target_node_id TEXT PRIMARY KEY,
+                declaration_json TEXT NOT NULL
+            )''')
+
+            await db.execute('''CREATE TABLE IF NOT EXISTS detector_events (
+                event_id TEXT PRIMARY KEY,
+                event_json TEXT NOT NULL,
+                received_at_utc TEXT NOT NULL
+            )''')
+
+            await db.execute('''CREATE TABLE IF NOT EXISTS tainted_rejections (
+                node_id TEXT NOT NULL,
+                tainted_parent_id TEXT NOT NULL,
+                rejected_at_utc TEXT NOT NULL,
+                served INTEGER DEFAULT 0,
+                served_by_exposure_id TEXT
+            )''')
             
             await db.commit()
 
@@ -724,3 +743,85 @@ class SqliteStateBackend(BaseStateBackend):
             async with db.execute(query, params) as cursor:
                 rows = await cursor.fetchall()
                 return sorted([r[0] for r in rows])
+
+    # --- Substitute declarations (M3) ---
+    async def add_substitute_declaration(self, declaration: dict):
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO substitute_declarations (target_node_id, declaration_json) VALUES (?, ?)",
+                (declaration["target_node_id"], json.dumps(declaration))
+            )
+            await db.commit()
+
+    async def get_substitute_declarations(self) -> Dict[str, dict]:
+        async with self._connect() as db:
+            async with db.execute("SELECT target_node_id, declaration_json FROM substitute_declarations") as cursor:
+                rows = await cursor.fetchall()
+                return {row[0]: json.loads(row[1]) for row in rows}
+
+    # --- Detector event log ---
+    async def record_detector_event(self, event: dict):
+        from datetime import datetime, timezone
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO detector_events (event_id, event_json, received_at_utc) VALUES (?, ?, ?)",
+                (event.get("event_id", str(__import__('uuid').uuid4())), json.dumps(event), datetime.now(timezone.utc).isoformat() + "Z")
+            )
+            await db.commit()
+
+    async def get_detector_events(self) -> List[dict]:
+        async with self._connect() as db:
+            async with db.execute("SELECT event_json FROM detector_events ORDER BY received_at_utc") as cursor:
+                rows = await cursor.fetchall()
+                return [json.loads(row[0]) for row in rows]
+
+    # --- Critical function dependency tracking ---
+    async def get_critical_dependents(self, quarantined_node_ids: List[str]) -> List[dict]:
+        """Find DAG nodes with criticality_weight > 0 that are in or depend on quarantined nodes."""
+        if not quarantined_node_ids:
+            return []
+        dag = await self.get_dag()
+        q_set = set(quarantined_node_ids)
+        results = []
+        for nid, ndata in dag.items():
+            cw = ndata.get("criticality_weight", 0)
+            if cw <= 0:
+                continue
+            parents = [p["parent_node_id"] for p in ndata.get("parent_dependency_commitments", [])]
+            tainted_parents = [p for p in parents if p in q_set]
+            if nid in q_set or tainted_parents:
+                results.append({
+                    "node_id": nid,
+                    "criticality_weight": cw,
+                    "tainted_parents": tainted_parents if tainted_parents else [nid],
+                })
+        return results
+
+    # --- Tainted-action tracking (B.8) ---
+    async def record_tainted_rejection(self, node_id: str, parent_id: str, rejected_at_utc: str):
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO tainted_rejections (node_id, tainted_parent_id, rejected_at_utc) VALUES (?, ?, ?)",
+                (node_id, parent_id, rejected_at_utc)
+            )
+            await db.commit()
+
+    async def record_tainted_completion(self, rejection_node_id: str, exposure_id: str):
+        async with self._connect() as db:
+            await db.execute(
+                "UPDATE tainted_rejections SET served = 1, served_by_exposure_id = ? WHERE node_id = ? AND served = 0",
+                (exposure_id, rejection_node_id)
+            )
+            await db.commit()
+
+    async def get_tainted_action_stats(self) -> dict:
+        async with self._connect() as db:
+            async with db.execute("SELECT COUNT(*) FROM tainted_rejections") as cursor:
+                total = (await cursor.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM tainted_rejections WHERE served = 1") as cursor:
+                served = (await cursor.fetchone())[0]
+        return {
+            "total_rejections": total,
+            "served_by_continuity": served,
+            "completion_rate": served / total if total > 0 else 0.0,
+        }

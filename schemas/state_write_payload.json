@@ -96,6 +96,13 @@
       "type": "string",
       "const": "ECDSA-P256-SHA256",
       "description": "Signature algorithm. Only ECDSA-P256-SHA256 is accepted."
+    },
+    "criticality_weight": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0,
+      "description": "Criticality weight for safe-continuity triggering. 0 = no continuity attempted on quarantine; >0 = continuity fires for this node's dependents."
     }
   },
   "additionalProperties": false

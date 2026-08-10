@@ -250,6 +250,28 @@ class PostgresStateBackend(BaseStateBackend):
                 exposure_record_json JSONB NOT NULL
             )''')
 
+            await conn.execute('''CREATE TABLE IF NOT EXISTS substitute_declarations (
+                target_node_id TEXT PRIMARY KEY,
+                declaration_json JSONB NOT NULL
+            )''')
+
+            await conn.execute('''CREATE TABLE IF NOT EXISTS detector_events (
+                event_id TEXT PRIMARY KEY,
+                event_json JSONB NOT NULL,
+                received_at_utc TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )''')
+
+            await conn.execute('''CREATE TABLE IF NOT EXISTS tainted_rejections (
+                node_id TEXT NOT NULL,
+                tainted_parent_id TEXT NOT NULL,
+                rejected_at_utc TIMESTAMPTZ NOT NULL,
+                served BOOLEAN DEFAULT FALSE,
+                served_by_exposure_id TEXT
+            )''')
+
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tainted_rejections_node_served ON tainted_rejections(node_id, served)")
+
     # ---- DAG ----
 
     async def get_dag(self) -> Dict[str, Any]:
@@ -790,6 +812,92 @@ class PostgresStateBackend(BaseStateBackend):
             rows = await conn.fetch(query, uniq)
             return sorted([r["node_id"] for r in rows])
 
+    # ---- Substitute declarations (M3) ----
+
+    async def add_substitute_declaration(self, declaration: dict):
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO substitute_declarations (target_node_id, declaration_json) VALUES ($1, $2) "
+                "ON CONFLICT (target_node_id) DO UPDATE SET declaration_json = EXCLUDED.declaration_json",
+                declaration["target_node_id"], declaration
+            )
+
+    async def get_substitute_declarations(self) -> Dict[str, dict]:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT target_node_id, declaration_json FROM substitute_declarations")
+            return {r["target_node_id"]: r["declaration_json"] for r in rows}
+
+    # ---- Detector event log ----
+
+    async def record_detector_event(self, event: dict):
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            import uuid as _uuid
+            await conn.execute(
+                "INSERT INTO detector_events (event_id, event_json) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                event.get("event_id", str(_uuid.uuid4())), event
+            )
+
+    async def get_detector_events(self) -> List[dict]:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT event_json FROM detector_events ORDER BY received_at_utc")
+            return [r["event_json"] for r in rows]
+
+    # ---- Critical function dependency tracking ----
+
+    async def get_critical_dependents(self, quarantined_node_ids: List[str]) -> List[dict]:
+        """Find DAG nodes with criticality_weight > 0 that are in or depend on quarantined nodes."""
+        if not quarantined_node_ids:
+            return []
+        dag = await self.get_dag()
+        q_set = set(quarantined_node_ids)
+        results = []
+        for nid, ndata in dag.items():
+            cw = ndata.get("criticality_weight", 0)
+            if cw <= 0:
+                continue
+            parents = [p["parent_node_id"] for p in ndata.get("parent_dependency_commitments", [])]
+            tainted_parents = [p for p in parents if p in q_set]
+            if nid in q_set or tainted_parents:
+                results.append({
+                    "node_id": nid,
+                    "criticality_weight": cw,
+                    "tainted_parents": tainted_parents if tainted_parents else [nid],
+                })
+        return results
+
+    # ---- Tainted-action tracking (B.8) ----
+
+    async def record_tainted_rejection(self, node_id: str, parent_id: str, rejected_at_utc: str):
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO tainted_rejections (node_id, tainted_parent_id, rejected_at_utc) VALUES ($1, $2, $3)",
+                node_id, parent_id, rejected_at_utc
+            )
+
+    async def record_tainted_completion(self, rejection_node_id: str, exposure_id: str):
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE tainted_rejections SET served = TRUE, served_by_exposure_id = $1 WHERE node_id = $2 AND served = FALSE",
+                exposure_id, rejection_node_id
+            )
+
+    async def get_tainted_action_stats(self) -> dict:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            total = await conn.fetchval("SELECT COUNT(*) FROM tainted_rejections")
+            served = await conn.fetchval("SELECT COUNT(*) FROM tainted_rejections WHERE served = TRUE")
+        return {
+            "total_rejections": total,
+            "served_by_continuity": served,
+            "completion_rate": served / total if total > 0 else 0.0,
+        }
+
     # ---- Reset ----
 
     async def reset(self):
@@ -810,6 +918,9 @@ class PostgresStateBackend(BaseStateBackend):
                 await conn.execute("DELETE FROM signal_attempts")
                 await conn.execute("DELETE FROM shadow_decisions")
                 await conn.execute("DELETE FROM continuity_exposures")
+                await conn.execute("DELETE FROM substitute_declarations")
+                await conn.execute("DELETE FROM detector_events")
+                await conn.execute("DELETE FROM tainted_rejections")
 
         await self.commit_node({"payload_id": "clean-parent-1", "parent_dependency_commitments": []})
         pool = await self._get_pool()

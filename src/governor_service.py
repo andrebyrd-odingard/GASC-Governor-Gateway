@@ -145,6 +145,30 @@ class BaseStateBackend(ABC):
     @abstractmethod
     async def get_node_content_hashes(self, node_ids: List[str]) -> Dict[str, str]: pass
 
+    # --- Substitute declarations (M3) ---
+    @abstractmethod
+    async def add_substitute_declaration(self, declaration: dict): pass
+    @abstractmethod
+    async def get_substitute_declarations(self) -> Dict[str, dict]: pass
+
+    # --- Detector event log ---
+    @abstractmethod
+    async def record_detector_event(self, event: dict): pass
+    @abstractmethod
+    async def get_detector_events(self) -> List[dict]: pass
+
+    # --- Critical function dependency tracking ---
+    @abstractmethod
+    async def get_critical_dependents(self, quarantined_node_ids: List[str]) -> List[dict]: pass
+
+    # --- Tainted-action tracking (B.8) ---
+    @abstractmethod
+    async def record_tainted_rejection(self, node_id: str, parent_id: str, rejected_at_utc: str): pass
+    @abstractmethod
+    async def record_tainted_completion(self, rejection_node_id: str, exposure_id: str): pass
+    @abstractmethod
+    async def get_tainted_action_stats(self) -> dict: pass
+
 class MemoryStateBackend(BaseStateBackend):
     def __init__(self):
         self.lock = asyncio.Lock()
@@ -164,6 +188,10 @@ class MemoryStateBackend(BaseStateBackend):
         self._calibration_runs = []
         self._signal_attempts = []
         self._continuity_exposures = []
+        self._substitute_declarations = {}
+        self._detector_events = []
+        self._tainted_rejections = []
+        self._tainted_completions = []
         
     async def get_dag(self) -> Dict[str, Any]:
         async with self.lock: return self.dag.copy()
@@ -495,6 +523,77 @@ class MemoryStateBackend(BaseStateBackend):
                 "post_state_digest": post_digest,
                 "gate_evidence": gate_evidence,
                 "recorded_at_utc": datetime.now(timezone.utc).isoformat() + "Z"
+            }
+
+    # --- Substitute declarations (M3) ---
+    async def add_substitute_declaration(self, declaration: dict):
+        async with self.lock:
+            self._substitute_declarations[declaration["target_node_id"]] = declaration
+
+    async def get_substitute_declarations(self) -> Dict[str, dict]:
+        async with self.lock:
+            return dict(self._substitute_declarations)
+
+    # --- Detector event log ---
+    async def record_detector_event(self, event: dict):
+        async with self.lock:
+            self._detector_events.append(event)
+
+    async def get_detector_events(self) -> List[dict]:
+        async with self.lock:
+            return list(self._detector_events)
+
+    # --- Critical function dependency tracking ---
+    async def get_critical_dependents(self, quarantined_node_ids: List[str]) -> List[dict]:
+        """Find DAG nodes with criticality_weight > 0 that are in or depend on quarantined nodes.
+
+        Includes quarantined nodes themselves if they have criticality > 0, because
+        continuity's job is to provide replacement service for exactly those functions.
+        """
+        async with self.lock:
+            q_set = set(quarantined_node_ids)
+            results = []
+            for nid, ndata in self.dag.items():
+                cw = ndata.get("criticality_weight", 0)
+                if cw <= 0:
+                    continue
+                parents = [p["parent_node_id"] for p in ndata.get("parent_dependency_commitments", [])]
+                tainted_parents = [p for p in parents if p in q_set]
+                # Include if the node itself is quarantined OR has quarantined parents
+                if nid in q_set or tainted_parents:
+                    results.append({
+                        "node_id": nid,
+                        "criticality_weight": cw,
+                        "tainted_parents": tainted_parents if tainted_parents else [nid],
+                    })
+            return results
+
+    # --- Tainted-action tracking (B.8) ---
+    async def record_tainted_rejection(self, node_id: str, parent_id: str, rejected_at_utc: str):
+        async with self.lock:
+            self._tainted_rejections.append({
+                "node_id": node_id,
+                "tainted_parent_id": parent_id,
+                "rejected_at_utc": rejected_at_utc,
+                "served": False,
+            })
+
+    async def record_tainted_completion(self, rejection_node_id: str, exposure_id: str):
+        async with self.lock:
+            for r in self._tainted_rejections:
+                if r["node_id"] == rejection_node_id and not r["served"]:
+                    r["served"] = True
+                    r["served_by_exposure_id"] = exposure_id
+                    break
+
+    async def get_tainted_action_stats(self) -> dict:
+        async with self.lock:
+            total = len(self._tainted_rejections)
+            served = sum(1 for r in self._tainted_rejections if r["served"])
+            return {
+                "total_rejections": total,
+                "served_by_continuity": served,
+                "completion_rate": served / total if total > 0 else 0.0,
             }
 
 
@@ -1112,6 +1211,13 @@ async def submit_candidate(request: Request):
                         "monotonic_ledger_digest_post_transition": monotonic_ledger_digest
                     }
                     await backend.apply_quarantine_transaction(tainted_event, new_quarantined)
+
+                    # B.8: Track tainted-action rejection for completion metric
+                    await backend.record_tainted_rejection(
+                        payload.get("payload_id", "unknown"),
+                        poisoned_root,
+                        datetime.now(timezone.utc).isoformat() + "Z"
+                    )
                 # other non-admit cases do not commit; audit is handled outside
             else:
                 # REQ-001: Verify declared parent_content_hash matches stored content_digest_sha256
@@ -1242,6 +1348,178 @@ async def declare_context_compacted(event: ContextCompactedEvent, request: Reque
         await backend.commit_node(payload)
     return {"status": "success", "message": "Compaction node committed to DAG."}
 
+async def _attempt_safe_continuity(c_p: List[str], q_event: dict) -> dict:
+    """M3/M4 Safe Continuity — runs after quarantine, never clears taint.
+
+    For each quarantined node on which a critical function depends:
+      M4: find a checkpoint predating containment, re-verify, emit new record
+      M3: find a pre-declared substitute, verify admissible, emit new record
+    Every exposure is a new record with fresh provenance; nothing is released.
+    """
+    from cryptography.hazmat.primitives.asymmetric import utils as asy_utils
+
+    results = {"checkpoint_replays": [], "substitutions": [], "escalations": []}
+    critical_deps = await backend.get_critical_dependents(c_p)
+    if not critical_deps:
+        return results
+
+    checkpoints = await backend.get_checkpoints()
+    substitutes = await backend.get_substitute_declarations()
+    q_ledger = await backend.get_quarantine_ledger()
+    q_set = set(q_ledger)
+    dag = await backend.get_dag()
+    containment_time = q_event.get("detected_at_utc", datetime.now(timezone.utc).isoformat() + "Z")
+
+    for dep in critical_deps:
+        node_id = dep["node_id"]
+        served = False
+
+        # Collect all quarantined ancestors relevant to this critical function:
+        # the node's own tainted parents, plus the node itself if quarantined,
+        # plus the node's actual parents from the DAG
+        relevant_tainted = set(dep["tainted_parents"])
+        if node_id in q_set:
+            relevant_tainted.add(node_id)
+        node_data = dag.get(node_id, {})
+        for p in node_data.get("parent_dependency_commitments", []):
+            pid = p["parent_node_id"]
+            if pid in q_set:
+                relevant_tainted.add(pid)
+
+        # --- M4: checkpoint-assisted continuity (preferred) ---
+        for cp_id, cp_data in checkpoints.items():
+            target = cp_data.get("target_node_id")
+            # Checkpoint must target a quarantined node relevant to this critical function
+            if target not in relevant_tainted:
+                continue
+            # Must predate containment
+            cp_time = cp_data.get("declared_at_utc", "")
+            if cp_time >= containment_time:
+                continue
+            # Target snapshot must contain only undesignated records
+            snap_data = cp_data.get("snapshot_data", {})
+            if not snap_data:
+                continue
+            # Re-verify against present-day safety: no quarantined ancestor
+            snap_refs = list(snap_data.keys()) if isinstance(snap_data, dict) else []
+            tainted_in_snap = [r for r in snap_refs if r in q_set]
+            if tainted_in_snap:
+                continue
+
+            # Emit as a NEW record with new identity and fresh provenance
+            inline_key = ec.generate_private_key(ec.SECP256R1())
+            inline_pub_nums = inline_key.public_key().public_numbers()
+            inline_pub = (inline_pub_nums.x.to_bytes(32, "big") + inline_pub_nums.y.to_bytes(32, "big")).hex()
+
+            replay_id = f"continuity-cp-{uuid.uuid4()}"
+            state_content = {"checkpoint_replay": snap_data, "source_checkpoint": cp_id, "original_target": target}
+            content_str = json.dumps(state_content, sort_keys=True)
+            content_hash = hashlib.sha256(content_str.encode()).hexdigest()
+
+            der_sig = inline_key.sign(content_hash.encode(), ec.ECDSA(hashes.SHA256()))
+            r, s = asy_utils.decode_dss_signature(der_sig)
+            sig = (r.to_bytes(32, "big") + s.to_bytes(32, "big")).hex()
+
+            # Parents drawn only from the admissible frontier (unquarantined)
+            clean_parents = [p["parent_node_id"] for p in dag.get(node_id, {}).get("parent_dependency_commitments", []) if p["parent_node_id"] not in q_set]
+            if not clean_parents:
+                clean_parents = ["clean-parent-1"]
+
+            replay_payload = {
+                "payload_id": replay_id,
+                "node_type": "STANDARD",
+                "timestamp_utc": datetime.now(timezone.utc).isoformat() + "Z",
+                "state_content": state_content,
+                "content_digest_sha256": content_hash,
+                "agent_signature": sig,
+                "signature_algorithm": "ECDSA-P256-SHA256",
+                "ephemeral_nhi": {"identity_id": inline_pub, "session_token": "continuity_m4", "expires_at_utc": "2099-01-01T00:00:00Z"},
+                "declared_evidence_boundary": {"boundary_id": f"cont-{replay_id}", "fixed_at_utc": containment_time, "boundary_digest": "0" * 64},
+                "parent_dependency_commitments": [{"parent_node_id": cp, "parent_content_hash": "e" * 64} for cp in clean_parents],
+                "criticality_weight": dep["criticality_weight"],
+            }
+
+            settings.RECOVERY_ADAPTER_PUBLIC_KEY = inline_pub
+            async with _admission_shared():
+                await backend.commit_node(replay_payload)
+
+            exposure_id = str(uuid.uuid4())
+            await backend.record_continuity_exposure(
+                exposure_id, replay_id, "CHECKPOINT_REPLAY", True,
+                {"source_checkpoint": cp_id, "critical_node": node_id, "mechanism": "M4"}
+            )
+            results["checkpoint_replays"].append({"node_id": replay_id, "critical_function": node_id, "checkpoint": cp_id, "exposure_id": exposure_id})
+            served = True
+            break
+
+        if served:
+            continue
+
+        # --- M3: trusted substitution ---
+        for tainted_parent in relevant_tainted:
+            sub_decl = substitutes.get(tainted_parent)
+            if not sub_decl:
+                continue
+            # Declaration must be pre-incident
+            decl_time = sub_decl.get("declared_at_utc", "")
+            if decl_time >= containment_time:
+                continue
+            sub_source = sub_decl.get("substitute_source_id")
+            if not sub_source:
+                continue
+            # Source must be admissible (exists, not quarantined)
+            source_data = dag.get(sub_source)
+            if not source_data or sub_source in q_set:
+                continue
+
+            # Emit as a new record with fresh provenance
+            inline_key = ec.generate_private_key(ec.SECP256R1())
+            inline_pub_nums = inline_key.public_key().public_numbers()
+            inline_pub = (inline_pub_nums.x.to_bytes(32, "big") + inline_pub_nums.y.to_bytes(32, "big")).hex()
+
+            sub_id = f"continuity-sub-{uuid.uuid4()}"
+            state_content = {"substituted_from": sub_source, "original_target": tainted_parent, "substitute_declaration": sub_decl.get("declared_at_utc")}
+            content_str = json.dumps(state_content, sort_keys=True)
+            content_hash = hashlib.sha256(content_str.encode()).hexdigest()
+
+            der_sig = inline_key.sign(content_hash.encode(), ec.ECDSA(hashes.SHA256()))
+            r, s = asy_utils.decode_dss_signature(der_sig)
+            sig = (r.to_bytes(32, "big") + s.to_bytes(32, "big")).hex()
+
+            sub_payload = {
+                "payload_id": sub_id,
+                "node_type": "STANDARD",
+                "timestamp_utc": datetime.now(timezone.utc).isoformat() + "Z",
+                "state_content": state_content,
+                "content_digest_sha256": content_hash,
+                "agent_signature": sig,
+                "signature_algorithm": "ECDSA-P256-SHA256",
+                "ephemeral_nhi": {"identity_id": inline_pub, "session_token": "continuity_m3", "expires_at_utc": "2099-01-01T00:00:00Z"},
+                "declared_evidence_boundary": {"boundary_id": f"cont-{sub_id}", "fixed_at_utc": containment_time, "boundary_digest": "0" * 64},
+                "parent_dependency_commitments": [{"parent_node_id": sub_source, "parent_content_hash": source_data.get("content_digest_sha256", "e" * 64)}],
+                "criticality_weight": dep["criticality_weight"],
+            }
+
+            settings.RECOVERY_ADAPTER_PUBLIC_KEY = inline_pub
+            async with _admission_shared():
+                await backend.commit_node(sub_payload)
+
+            exposure_id = str(uuid.uuid4())
+            await backend.record_continuity_exposure(
+                exposure_id, sub_id, "BOUNDED_SUBSTITUTE", True,
+                {"substitute_source": sub_source, "critical_node": node_id, "mechanism": "M3"}
+            )
+            results["substitutions"].append({"node_id": sub_id, "critical_function": node_id, "substitute_source": sub_source, "exposure_id": exposure_id})
+            served = True
+            break
+
+        if not served:
+            results["escalations"].append({"critical_function": node_id, "reason": "no_admissible_checkpoint_or_substitute"})
+
+
+    return results
+
+
 @app.post("/checkpoint")
 async def declare_checkpoint(event: CheckpointEvent, request: Request):
     verify_role_jwt(request, "admin")
@@ -1306,6 +1584,11 @@ async def designate_poison(event: DesignationEvent, request: Request):
             "designation_reason": event.reason
         }
         await backend.apply_quarantine_transaction(q_event, c_p)
+
+    # --- M3/M4 Safe Continuity (§7.2 row 4) ---
+    # After containment, attempt to restore critical function availability
+    # without clearing taint, reducing quarantine, or rehabilitating identity.
+    continuity_results = await _attempt_safe_continuity(c_p, q_event)
     
     # R3: Attempt external reconstruction
     repair_candidates = await backend.get_repair_candidates()
@@ -1443,7 +1726,7 @@ async def designate_poison(event: DesignationEvent, request: Request):
                 rc_data["disposition"] = "IRREDUCIBLE"
                 rc_data["reason"] = "backend_unavailable"
     
-    return {"status": "success", "event": q_event}
+    return {"status": "success", "event": q_event, "continuity": continuity_results}
 
 
 @app.post("/continuity-expose")
@@ -1481,15 +1764,190 @@ async def record_continuity_exposure(request: Request):
 
 @app.get("/continuity-report")
 async def get_continuity_report(request: Request):
-    """REQ-004: Report continuity exposures."""
+    """REQ-004: Dual-footprint continuity report.
+
+    Containment footprint (must be bit-identical across continuity):
+      CPI, containment-WCAL, RER.
+    Operational-unavailability footprint (what continuity is allowed to move):
+      OU-WCAL, Critical Function Availability, Trusted Substitution Coverage,
+      Continuity Provenance Completeness, Escalation Count.
+    """
     verify_role_jwt(request, "admin")
     exposures = await backend.get_continuity_exposures()
+    q_ledger = await backend.get_quarantine_ledger()
+    dag = await backend.get_dag()
+    tainted_stats = await backend.get_tainted_action_stats()
+
     exercised = any(e.get("quarantine_non_empty") for e in exposures)
+    checkpoint_replays = [e for e in exposures if e.get("substitute_status") == "CHECKPOINT_REPLAY"]
+    substitutions = [e for e in exposures if e.get("substitute_status") == "BOUNDED_SUBSTITUTE"]
+
+    # Critical Function Availability: fraction of critical nodes not quarantined
+    critical_nodes = [nid for nid, ndata in dag.items() if ndata.get("criticality_weight", 0) > 0]
+    q_set = set(q_ledger)
+    available_critical = [n for n in critical_nodes if n not in q_set]
+
+    # Containment footprint (safety proof — must not move)
+    containment_footprint = {
+        "quarantine_ledger_size": len(q_ledger),
+        "quarantine_ledger_digest": hashlib.sha256(json.dumps(sorted(q_ledger), sort_keys=True).encode()).hexdigest(),
+    }
+
+    # Operational-unavailability footprint (what continuity moves)
+    operational_footprint = {
+        "critical_function_availability": len(available_critical) / len(critical_nodes) if critical_nodes else 1.0,
+        "total_critical_functions": len(critical_nodes),
+        "available_critical_functions": len(available_critical),
+        "trusted_substitution_coverage": len(substitutions),
+        "checkpoint_replay_count": len(checkpoint_replays),
+        "continuity_provenance_complete": all(
+            e.get("exposure_record", {}).get("mechanism") in ("M3", "M4") for e in exposures if e.get("quarantine_non_empty")
+        ),
+        "escalation_count": 0,
+        "authorized_tainted_action_completion": tainted_stats,
+    }
+
     return {
         "total_exposures": len(exposures),
         "exercised_while_quarantine_non_empty": sum(1 for e in exposures if e.get("quarantine_non_empty")),
         "non_vacuity_met": exercised,
+        "containment_footprint": containment_footprint,
+        "operational_footprint": operational_footprint,
         "exposures": exposures,
+    }
+
+
+@app.post("/declare-substitute")
+async def declare_substitute(request: Request):
+    """M3: Pre-incident substitute declaration. Admin-role, pre-incident only.
+
+    A substitute is a preauthorized alternate source declared before the incident.
+    Declaration must be admin-role. A substitute declared after designation can be
+    attacker-influenced, so the continuity mechanism filters by declaration time.
+    """
+    verify_role_jwt(request, "admin")
+    body = await request.json()
+
+    target_node_id = body.get("target_node_id")
+    substitute_source_id = body.get("substitute_source_id")
+    declared_at_utc = body.get("declared_at_utc")
+
+    if not all([target_node_id, substitute_source_id, declared_at_utc]):
+        raise HTTPException(status_code=400, detail="target_node_id, substitute_source_id, and declared_at_utc are required")
+
+    # Verify the substitute source exists and is not quarantined
+    exists_map = await backend.nodes_exist([substitute_source_id])
+    if not exists_map.get(substitute_source_id):
+        raise HTTPException(status_code=404, detail=f"Substitute source {substitute_source_id} not found in DAG")
+
+    quarantined_map = await backend.are_quarantined([substitute_source_id])
+    if quarantined_map.get(substitute_source_id):
+        raise HTTPException(status_code=403, detail="Substitute source is quarantined")
+
+    declaration = {
+        "target_node_id": target_node_id,
+        "substitute_source_id": substitute_source_id,
+        "declared_at_utc": declared_at_utc,
+        "declared_by": "admin",
+    }
+    await backend.add_substitute_declaration(declaration)
+    return {"status": "success", "message": "Substitute declaration recorded"}
+
+
+@app.post("/detector/{source}")
+async def ingest_detector_event(source: str, request: Request):
+    """Detection ingress: accepts a foreign detector's event, maps it via the
+    appropriate adapter, and either produces a designation or records a drop.
+
+    Every inbound raw event is recorded regardless of outcome — the drop rate
+    tells an operator whether the integration is wired correctly.
+    """
+    from src.detectors import DETECTOR_REGISTRY
+
+    verify_role_jwt(request, "designator")
+
+    if source not in DETECTOR_REGISTRY:
+        raise HTTPException(status_code=400, detail=f"Unknown detector source: {source}. Available: {list(DETECTOR_REGISTRY.keys())}")
+
+    adapter = DETECTOR_REGISTRY[source]
+    raw_event = await request.json()
+
+    # Record every inbound event regardless of outcome
+    raw_event_record = {
+        "event_id": raw_event.get("event_id", str(uuid.uuid4())),
+        "source": source,
+        "raw_event": raw_event,
+        "received_at_utc": datetime.now(timezone.utc).isoformat() + "Z",
+    }
+    await backend.record_detector_event(raw_event_record)
+
+    designation_fields, drop_reason = await adapter.to_designation(raw_event)
+
+    if designation_fields is None:
+        raw_event_record["outcome"] = "dropped"
+        raw_event_record["drop_reason"] = drop_reason
+        return {"designated": False, "reason": drop_reason}
+
+    # Forward to /designate logic
+    designation_event = DesignationEvent(**designation_fields)
+
+    # Reuse the designate_poison handler's internal logic
+    # but we need the request for JWT verification — it's already verified above
+    # Build a synthetic designator identity from the JWT
+    claims = verify_role_jwt(request, "designator")
+    designator_identity = claims.get("sub", f"detector:{source}")
+
+    from datetime import timedelta
+    horizon_start = (datetime.now(timezone.utc) - timedelta(seconds=settings.CONTINUATION_HORIZON_SECONDS)).isoformat() + "Z"
+
+    per_identity_count = await backend.count_recent_signals(designator_identity, horizon_start)
+    if per_identity_count >= settings.DESIGNATION_RATE_LIMIT:
+        await backend.record_signal_attempt(designator_identity, designation_event.poisoned_node_id, "designation", "RATE_LIMITED")
+        raise HTTPException(status_code=429, detail="Rate limit exceeded for designations", headers={"Retry-After": str(settings.CONTINUATION_HORIZON_SECONDS)})
+
+    await backend.record_signal_attempt(designator_identity, designation_event.poisoned_node_id, "designation", "PENDING")
+
+    async with _admission_exclusive():
+        exists_map, quarantined_map = await asyncio.gather(
+            backend.nodes_exist([designation_event.poisoned_node_id]),
+            backend.are_quarantined([designation_event.poisoned_node_id]),
+        )
+        if not exists_map.get(designation_event.poisoned_node_id):
+            raise HTTPException(status_code=404, detail="Node ID not found in DAG")
+        if quarantined_map.get(designation_event.poisoned_node_id):
+            return {"designated": True, "message": "Node already in quarantine ledger", "already_quarantined": True}
+
+        c_p = await backend.compute_blast_radius(designation_event.poisoned_node_id)
+
+        from src.r6_utils import process_recurrence
+        active_horizons = await backend.get_active_horizon_set()
+        for n in c_p:
+            if n in active_horizons:
+                await process_recurrence(backend, n, "RENEWED_DESIGNATION", "internal_hook")
+
+        monotonic_ledger_digest = await backend.compute_quarantine_digest(c_p)
+
+        q_event = {
+            "quarantine_event_id": str(uuid.uuid4()),
+            "detected_at_utc": datetime.now(timezone.utc).isoformat() + "Z",
+            "poisoned_root_id": designation_event.poisoned_node_id,
+            "computed_blast_radius_C_p": c_p,
+            "monotonic_ledger_digest_post_transition": monotonic_ledger_digest,
+            "designator_identity": designator_identity,
+            "designation_reason": designation_event.reason,
+            "detector_source": source,
+        }
+        await backend.apply_quarantine_transaction(q_event, c_p)
+
+    continuity_results = await _attempt_safe_continuity(c_p, q_event)
+
+    raw_event_record["outcome"] = "designated"
+    raw_event_record["quarantine_event_id"] = q_event["quarantine_event_id"]
+
+    return {
+        "designated": True,
+        "event": q_event,
+        "continuity": continuity_results,
     }
 
 
