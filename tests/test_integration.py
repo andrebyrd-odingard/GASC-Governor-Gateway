@@ -20,7 +20,10 @@ def generate_admin_token():
 
 @pytest.fixture(autouse=True)
 def reset_db():
+    settings.ENFORCEMENT_MODE = "enforce"
     client.post("/reset-db", headers={"Authorization": f"Bearer {generate_admin_token()}"})
+    yield
+    settings.ENFORCEMENT_MODE = "shadow"
 
 def create_valid_payload(parent_id="clean-parent-1"):
     # Create valid JWT

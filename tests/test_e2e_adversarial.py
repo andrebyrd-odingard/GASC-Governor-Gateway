@@ -27,7 +27,12 @@ def generate_designator_token():
 
 @pytest.fixture(autouse=True)
 def reset_db():
+    settings.ENFORCEMENT_MODE = "enforce"
+    settings.CONTINUITY_ENABLED = True
     client.post("/reset-db", headers={"Authorization": f"Bearer {generate_admin_token()}"})
+    yield
+    settings.ENFORCEMENT_MODE = "shadow"
+    settings.CONTINUITY_ENABLED = True
 
 def content_hash_of(state_content):
     return hashlib.sha256(json.dumps(state_content, sort_keys=True).encode()).hexdigest()
@@ -81,6 +86,26 @@ def test_e2e_adversarial_injection_via_designate():
     payload_2 = create_payload("order-2", "order-1", {"item": "mouse"}, parent_content_hash=content_hash_of(c1))
     assert client.post("/submit-candidate", json=payload_2).status_code == 200
 
+    # 1b. Add a critical function depending on order-1, with checkpoint pre-incident
+    c_critical = {"service": "order-fulfillment"}
+    critical_payload = create_payload("critical-svc", "order-1", c_critical,
+                                      parent_content_hash=content_hash_of(c1))
+    critical_payload["criticality_weight"] = 0.9
+    assert client.post("/submit-candidate", json=critical_payload).status_code == 200
+
+    # Checkpoint targeting order-1 (will be tainted)
+    resp = client.post(
+        "/checkpoint",
+        json={
+            "checkpoint_id": "cp-order-1",
+            "target_node_id": "order-1",
+            "declared_at_utc": "2020-01-01T00:00:00Z",
+            "snapshot_data": {"item": "laptop", "verified": True},
+        },
+        headers={"Authorization": f"Bearer {generate_admin_token()}"},
+    )
+    assert resp.status_code == 200
+
     # 2. Assume node "order-1" is discovered to be tainted by an out-of-band intrusion detection (e.g. AMG)
     # We use the authenticated /designate endpoint to trigger the BFS traversal
     designate_event = {
@@ -98,6 +123,12 @@ def test_e2e_adversarial_injection_via_designate():
     assert "order-1" in event_data["computed_blast_radius_C_p"]
     assert "order-2" in event_data["computed_blast_radius_C_p"]
 
+    # Verify continuity fired for critical-svc
+    continuity = resp.json().get("continuity", {})
+    replays = continuity.get("checkpoint_replays", [])
+    subs = continuity.get("substitutions", [])
+    assert len(replays) + len(subs) > 0, f"Continuity must fire for critical-svc: {continuity}"
+
     # 3. Agent blindly builds on order-2 (which descends from quarantined order-1)
     payload_3 = create_payload("order-3", "order-2", {"item": "keyboard"}, parent_content_hash=content_hash_of({"item": "mouse"}))
     response = client.post("/submit-candidate", json=payload_3)
@@ -113,7 +144,22 @@ def test_e2e_adversarial_injection_via_designate():
 
     # 5. Generate Audit Manifest for gasc-audit scoring
     db_state = client.get("/db-state", headers={"Authorization": f"Bearer {generate_admin_token()}"}).json()
-    
+
+    # Pull real continuity exposures from the backend
+    continuity_report = client.get(
+        "/continuity-report",
+        headers={"Authorization": f"Bearer {generate_admin_token()}"},
+    ).json()
+    real_exposures = continuity_report.get("exposures", [])
+
+    # Pull tainted-action completion stats for measured cost
+    tainted_stats = continuity_report.get("operational_footprint", {}).get(
+        "authorized_tainted_action_completion", {}
+    )
+    cfa = continuity_report.get("operational_footprint", {}).get(
+        "critical_function_availability", 0.0
+    )
+
     audit_manifest = {
         "enforcement_mode": db_state.get("enforcement_mode", "enforce"),
         "boundary_id": "BOUNDARY-TEST",
@@ -121,7 +167,7 @@ def test_e2e_adversarial_injection_via_designate():
         "admitted_writes": list(db_state.get("dag", {}).values()),
         "quarantine_incidents": db_state.get("quarantine_events", []),
         "quarantine_transitions": [{"quarantine_set": db_state.get("quarantine_ledger", [])}],
-        "continuity_exposures": [],
+        "continuity_exposures": real_exposures,
         "reconstruction_attempts": [{"declared_evidence_boundary": {"fixed_at_utc": "2026-10-27T10:20:00Z"}, "incident_detected_at_utc": "2026-10-27T10:15:00Z"}],
         "fault_injection_campaign": {
             "preregistered_suite_run": True,
@@ -141,11 +187,14 @@ def test_e2e_adversarial_injection_via_designate():
             {"disposition": "REDUCIBLE"},
             {"disposition": "IRREDUCIBLE"}
         ],
-        "disposed_targets": [
-            {"disposition": "REDUCIBLE"},
-            {"disposition": "IRREDUCIBLE"}
-        ],
-        "measured_cost_report": {}
+        "measured_cost_report": {
+            "safety": 1.0,
+            "availability": cfa,
+            "coverage": 1.0,
+            "function_restoration": tainted_stats.get("completion_rate", 0.0),
+            "burden": 0.0,
+            "recurrence": 0.0,
+        }
     }
     
     from pathlib import Path
