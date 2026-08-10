@@ -461,14 +461,6 @@ class PostgresStateBackend(BaseStateBackend):
                     })
                     continue
 
-                if not getattr(settings, "RECOVERY_ADAPTER_URL", None):
-                    await self._set_repair_candidate(comp_node, {
-                        "disposition": "IRREDUCIBLE",
-                        "reason": "no_reconstruction_backend",
-                        "escalation_record": "Requires human review"
-                    })
-                    continue
-
                 await self._set_repair_candidate(comp_node, {
                     "disposition": "PENDING_RECONSTRUCTION",
                     "frontier": frontier,

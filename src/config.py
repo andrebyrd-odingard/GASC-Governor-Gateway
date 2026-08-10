@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     RECURRENCE_SIGNAL_GLOBAL_LIMIT: int = 100
     DESIGNATION_RATE_LIMIT: int = 20
     TRUST_RENEWAL_REQUIRED: bool = True
+    CONTINUITY_ENABLED: bool = True
 
     # Readiness / Backpressure Settings
     READINESS_PROBE_PATH: str = "/ready"

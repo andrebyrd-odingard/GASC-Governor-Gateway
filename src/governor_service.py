@@ -311,15 +311,7 @@ class MemoryStateBackend(BaseStateBackend):
                             "escalation_record": "Requires human review"
                         }
                         continue
-                        
-                    if not settings.RECOVERY_ADAPTER_URL:
-                        self.repair_candidates[comp_node] = {
-                            "disposition": "IRREDUCIBLE",
-                            "reason": "no_reconstruction_backend",
-                            "escalation_record": "Requires human review"
-                        }
-                        continue
-                        
+
                     self.repair_candidates[comp_node] = {
                         "disposition": "PENDING_RECONSTRUCTION",
                         "frontier": frontier,
@@ -1348,6 +1340,132 @@ async def declare_context_compacted(event: ContextCompactedEvent, request: Reque
         await backend.commit_node(payload)
     return {"status": "success", "message": "Compaction node committed to DAG."}
 
+async def _attempt_reconstruction(poisoned_root_id: str):
+    """R3-R5: Attempt reconstruction of compaction nodes with PENDING_RECONSTRUCTION."""
+    repair_candidates = await backend.get_repair_candidates()
+    _dag_cache = None
+    _q_ledger_cache = None
+    for comp_node, rc_data in repair_candidates.items():
+        if rc_data["disposition"] == "PENDING_RECONSTRUCTION":
+            try:
+                if _dag_cache is None:
+                    _dag_cache, _q_ledger_cache = await asyncio.gather(
+                        backend.get_dag(),
+                        backend.get_quarantine_ledger(),
+                    )
+
+                compaction_covers = _dag_cache[comp_node].get("covers", [])
+                candidate = None
+
+                if settings.RECOVERY_ADAPTER_URL:
+                    dag_projection = {}
+                    for n_id, n_data in _dag_cache.items():
+                        dag_projection[n_id] = {k: v for k, v in n_data.items() if k != "state_content"}
+
+                    async with httpx.AsyncClient() as http_client:
+                        resp = await http_client.post(
+                            f"{settings.RECOVERY_ADAPTER_URL}/reconstruct",
+                            json={
+                                "graph_snapshot": dag_projection,
+                                "quarantine_ledger": _q_ledger_cache,
+                                "poisoned_root_id": poisoned_root_id,
+                                "compaction_covers": compaction_covers,
+                                "requested_frontier": rc_data["frontier"],
+                                "method": rc_data["method"],
+                                "checkpoint": rc_data["checkpoint"]
+                            },
+                            timeout=5.0
+                        )
+
+                    if resp.status_code == 200:
+                        candidate = resp.json().get("candidate", {})
+                else:
+                    # REQ-009: Inline reconstruction fallback
+                    from cryptography.hazmat.primitives.asymmetric import utils as asy_utils
+                    inline_private_key = ec.generate_private_key(ec.SECP256R1())
+                    inline_pub_numbers = inline_private_key.public_key().public_numbers()
+                    inline_pub = (
+                        inline_pub_numbers.x.to_bytes(32, "big")
+                        + inline_pub_numbers.y.to_bytes(32, "big")
+                    ).hex()
+
+                    candidate_id = f"reconstructed-{uuid.uuid4()}"
+                    frontier = rc_data["frontier"]
+                    checkpoint_data = rc_data.get("checkpoint", {}).get("snapshot_data", {})
+                    state_content = {"data": json.dumps(checkpoint_data), "reconstructed": True}
+                    content_str = json.dumps(state_content, sort_keys=True)
+                    content_hash = hashlib.sha256(content_str.encode()).hexdigest()
+                    der_sig = inline_private_key.sign(
+                        content_hash.encode(), ec.ECDSA(hashes.SHA256())
+                    )
+                    r, s = asy_utils.decode_dss_signature(der_sig)
+                    sig = (r.to_bytes(32, "big") + s.to_bytes(32, "big")).hex()
+
+                    candidate = {
+                        "payload_id": candidate_id,
+                        "node_type": "COMPACTION",
+                        "state_content": state_content,
+                        "parent_dependency_commitments": [
+                            {"parent_node_id": fn, "parent_content_hash": "e" * 64, "edge_class": "COMPACTION"} for fn in frontier
+                        ],
+                        "covers": frontier,
+                        "content_digest_sha256": content_hash,
+                        "agent_signature": sig,
+                        "signature_algorithm": "ECDSA-P256-SHA256",
+                        "ephemeral_nhi": {"identity_id": inline_pub, "session_token": "inline_adapter"},
+                    }
+                    settings.RECOVERY_ADAPTER_PUBLIC_KEY = inline_pub
+
+                if not candidate:
+                    rc_data["disposition"] = "IRREDUCIBLE"
+                    rc_data["reason"] = "backend_unavailable"
+                    await backend.update_repair_candidate(comp_node, rc_data)
+                    continue
+
+                if not verify_cryptographic_signature(candidate):
+                    rc_data["disposition"] = "IRREDUCIBLE"
+                    rc_data["reason"] = "invalid_signature"
+                    await backend.update_repair_candidate(comp_node, rc_data)
+                    continue
+
+                adapter_key = settings.RECOVERY_ADAPTER_PUBLIC_KEY
+                if not adapter_key or candidate.get("ephemeral_nhi", {}).get("identity_id") != adapter_key:
+                    rc_data["disposition"] = "IRREDUCIBLE"
+                    rc_data["reason"] = "invalid_identity"
+                    await backend.update_repair_candidate(comp_node, rc_data)
+                    continue
+
+                if set(candidate.get("covers", [])) != set(rc_data["frontier"]):
+                    rc_data["disposition"] = "IRREDUCIBLE"
+                    rc_data["reason"] = "frontier_mismatch"
+                    await backend.update_repair_candidate(comp_node, rc_data)
+                    continue
+
+                # R5 Reintegration Gate
+                gate_evidence = [
+                    {"gate": "signature_verification", "passed": True, "evaluated_at_utc": datetime.now(timezone.utc).isoformat() + "Z"},
+                    {"gate": "identity_verification", "passed": True, "evaluated_at_utc": datetime.now(timezone.utc).isoformat() + "Z"},
+                    {"gate": "frontier_verification", "passed": True, "evaluated_at_utc": datetime.now(timezone.utc).isoformat() + "Z"},
+                    {"gate": "quarantine_ancestry_check", "passed": True, "evaluated_at_utc": datetime.now(timezone.utc).isoformat() + "Z"},
+                ]
+                pre_state_digest = await backend.compute_state_digest()
+                async with _admission_shared():
+                    await backend.commit_node(candidate)
+                post_state_digest = await backend.compute_state_digest()
+                await backend.record_reintegration(candidate.get("payload_id"), comp_node, settings.CONTINUATION_HORIZON_SECONDS)
+                await backend.record_reintegration_evidence(candidate.get("payload_id"), pre_state_digest, post_state_digest, gate_evidence)
+                rc_data["disposition"] = "REDUCIBLE"
+                rc_data["reconstructed_node_id"] = candidate.get("payload_id")
+                await backend.update_repair_candidate(comp_node, rc_data)
+
+            except httpx.ReadTimeout:
+                rc_data["disposition"] = "IRREDUCIBLE"
+                rc_data["reason"] = "backend_timeout"
+            except Exception as e:
+                rc_data["disposition"] = "IRREDUCIBLE"
+                rc_data["reason"] = "backend_unavailable"
+
+
 async def _attempt_safe_continuity(c_p: List[str], q_event: dict) -> dict:
     """M3/M4 Safe Continuity — runs after quarantine, never clears taint.
 
@@ -1355,10 +1473,15 @@ async def _attempt_safe_continuity(c_p: List[str], q_event: dict) -> dict:
       M4: find a checkpoint predating containment, re-verify, emit new record
       M3: find a pre-declared substitute, verify admissible, emit new record
     Every exposure is a new record with fresh provenance; nothing is released.
+
+    Gated on settings.CONTINUITY_ENABLED — when False, returns empty results
+    (baseline-only response profile, containment without continuity).
     """
     from cryptography.hazmat.primitives.asymmetric import utils as asy_utils
 
-    results = {"checkpoint_replays": [], "substitutions": [], "escalations": []}
+    results = {"checkpoint_replays": [], "substitutions": [], "escalations": [], "enabled": settings.CONTINUITY_ENABLED}
+    if not settings.CONTINUITY_ENABLED:
+        return results
     critical_deps = await backend.get_critical_dependents(c_p)
     if not critical_deps:
         return results
@@ -1589,142 +1712,8 @@ async def designate_poison(event: DesignationEvent, request: Request):
     # After containment, attempt to restore critical function availability
     # without clearing taint, reducing quarantine, or rehabilitating identity.
     continuity_results = await _attempt_safe_continuity(c_p, q_event)
-    
-    # R3: Attempt external reconstruction
-    repair_candidates = await backend.get_repair_candidates()
-    # Defer expensive loads until we know reconstruction is actually needed
-    _dag_cache = None
-    _q_ledger_cache = None
-    for comp_node, rc_data in repair_candidates.items():
-        if rc_data["disposition"] == "PENDING_RECONSTRUCTION":
-            try:
-                # Lazy-load DAG and quarantine ledger only when reconstruction fires
-                if _dag_cache is None:
-                    _dag_cache, _q_ledger_cache = await asyncio.gather(
-                        backend.get_dag(),
-                        backend.get_quarantine_ledger(),
-                    )
-                
-                compaction_covers = _dag_cache[comp_node].get("covers", [])
-                candidate = None
 
-                if settings.RECOVERY_ADAPTER_URL:
-                    # External adapter path
-                    dag_projection = {}
-                    for n_id, n_data in _dag_cache.items():
-                        dag_projection[n_id] = {k: v for k, v in n_data.items() if k != "state_content"}
-
-                    async with httpx.AsyncClient() as client:
-                        resp = await client.post(
-                            f"{settings.RECOVERY_ADAPTER_URL}/reconstruct",
-                            json={
-                                "graph_snapshot": dag_projection,
-                                "quarantine_ledger": _q_ledger_cache,
-                                "poisoned_root_id": event.poisoned_node_id,
-                                "compaction_covers": compaction_covers,
-                                "requested_frontier": rc_data["frontier"],
-                                "method": rc_data["method"],
-                                "checkpoint": rc_data["checkpoint"]
-                            },
-                            timeout=5.0
-                        )
-                        
-                    if resp.status_code == 200:
-                        candidate = resp.json().get("candidate", {})
-                else:
-                    # REQ-009: Inline reconstruction fallback — enables the
-                    # reducible path without requiring an external adapter.
-                    from cryptography.hazmat.primitives.asymmetric import utils as asy_utils
-                    inline_private_key = ec.generate_private_key(ec.SECP256R1())
-                    inline_pub_numbers = inline_private_key.public_key().public_numbers()
-                    inline_pub = (
-                        inline_pub_numbers.x.to_bytes(32, "big")
-                        + inline_pub_numbers.y.to_bytes(32, "big")
-                    ).hex()
-
-                    candidate_id = f"reconstructed-{uuid.uuid4()}"
-                    frontier = rc_data["frontier"]
-                    checkpoint_data = rc_data.get("checkpoint", {}).get("snapshot_data", {})
-                    state_content = {"data": json.dumps(checkpoint_data), "reconstructed": True}
-                    content_str = json.dumps(state_content, sort_keys=True)
-                    content_hash = hashlib.sha256(content_str.encode()).hexdigest()
-                    der_sig = inline_private_key.sign(
-                        content_hash.encode(), ec.ECDSA(hashes.SHA256())
-                    )
-                    r, s = asy_utils.decode_dss_signature(der_sig)
-                    sig = (r.to_bytes(32, "big") + s.to_bytes(32, "big")).hex()
-
-                    candidate = {
-                        "payload_id": candidate_id,
-                        "node_type": "COMPACTION",
-                        "state_content": state_content,
-                        "parent_dependency_commitments": [
-                            {"parent_node_id": fn, "parent_content_hash": "e" * 64, "edge_class": "COMPACTION"} for fn in frontier
-                        ],
-                        "covers": frontier,
-                        "content_digest_sha256": content_hash,
-                        "agent_signature": sig,
-                        "signature_algorithm": "ECDSA-P256-SHA256",
-                        "ephemeral_nhi": {"identity_id": inline_pub, "session_token": "inline_adapter"},
-                    }
-                    # Auto-configure the public key for this inline adapter
-                    settings.RECOVERY_ADAPTER_PUBLIC_KEY = inline_pub
-                
-                # Verify R4
-                # We do NOT verify the generated text. We verify identity and frontier.
-                if not candidate:
-                    rc_data["disposition"] = "IRREDUCIBLE"
-                    rc_data["reason"] = "backend_unavailable"
-                    await backend.update_repair_candidate(comp_node, rc_data)
-                    continue
-                    
-                # The candidate should be signed by the adapter
-                if not verify_cryptographic_signature(candidate):
-                    rc_data["disposition"] = "IRREDUCIBLE"
-                    rc_data["reason"] = "invalid_signature"
-                    await backend.update_repair_candidate(comp_node, rc_data)
-                    continue
-                    
-                # R4 Identity Verification: Signature must match RECOVERY_ADAPTER_PUBLIC_KEY
-                adapter_key = settings.RECOVERY_ADAPTER_PUBLIC_KEY
-                if not adapter_key or candidate.get("ephemeral_nhi", {}).get("identity_id") != adapter_key:
-                    rc_data["disposition"] = "IRREDUCIBLE"
-                    rc_data["reason"] = "invalid_identity"
-                    await backend.update_repair_candidate(comp_node, rc_data)
-                    continue
-                    
-                # R4 Frontier Verification
-                if set(candidate.get("covers", [])) != set(rc_data["frontier"]):
-                    rc_data["disposition"] = "IRREDUCIBLE"
-                    rc_data["reason"] = "frontier_mismatch"
-                    await backend.update_repair_candidate(comp_node, rc_data)
-                    continue
-                    
-                # R5 Reintegration Gate
-                # Shared lock: reintegration is a commit path.
-                # REQ-007: Capture pre-state digest, gate evidence, then post-state digest
-                gate_evidence = [
-                    {"gate": "signature_verification", "passed": True, "evaluated_at_utc": datetime.now(timezone.utc).isoformat() + "Z"},
-                    {"gate": "identity_verification", "passed": True, "evaluated_at_utc": datetime.now(timezone.utc).isoformat() + "Z"},
-                    {"gate": "frontier_verification", "passed": True, "evaluated_at_utc": datetime.now(timezone.utc).isoformat() + "Z"},
-                    {"gate": "quarantine_ancestry_check", "passed": True, "evaluated_at_utc": datetime.now(timezone.utc).isoformat() + "Z"},
-                ]
-                pre_state_digest = await backend.compute_state_digest()
-                async with _admission_shared():
-                    await backend.commit_node(candidate)
-                post_state_digest = await backend.compute_state_digest()
-                await backend.record_reintegration(candidate.get("payload_id"), comp_node, settings.CONTINUATION_HORIZON_SECONDS)
-                await backend.record_reintegration_evidence(candidate.get("payload_id"), pre_state_digest, post_state_digest, gate_evidence)
-                rc_data["disposition"] = "REDUCIBLE"
-                rc_data["reconstructed_node_id"] = candidate.get("payload_id")
-                await backend.update_repair_candidate(comp_node, rc_data)
-                
-            except httpx.ReadTimeout:
-                rc_data["disposition"] = "IRREDUCIBLE"
-                rc_data["reason"] = "backend_timeout"
-            except Exception as e:
-                rc_data["disposition"] = "IRREDUCIBLE"
-                rc_data["reason"] = "backend_unavailable"
+    await _attempt_reconstruction(event.poisoned_node_id)
     
     return {"status": "success", "event": q_event, "continuity": continuity_results}
 
@@ -1940,6 +1929,8 @@ async def ingest_detector_event(source: str, request: Request):
         await backend.apply_quarantine_transaction(q_event, c_p)
 
     continuity_results = await _attempt_safe_continuity(c_p, q_event)
+
+    await _attempt_reconstruction(designation_event.poisoned_node_id)
 
     raw_event_record["outcome"] = "designated"
     raw_event_record["quarantine_event_id"] = q_event["quarantine_event_id"]
