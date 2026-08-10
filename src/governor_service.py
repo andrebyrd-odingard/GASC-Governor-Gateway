@@ -163,7 +163,8 @@ class BaseStateBackend(ABC):
 
     # --- Tainted-action tracking (B.8) ---
     @abstractmethod
-    async def record_tainted_rejection(self, node_id: str, parent_id: str, rejected_at_utc: str): pass
+    async def record_tainted_rejection(self, node_id: str, parent_id: str,
+                                       rejected_at_utc: str, author_identity: str = ""): pass
     @abstractmethod
     async def record_tainted_offer(self, rejection_node_id: str, replacement_node_id: str, replacement_type: str): pass
     @abstractmethod
@@ -572,12 +573,14 @@ class MemoryStateBackend(BaseStateBackend):
             return results
 
     # --- Tainted-action tracking (B.8) ---
-    async def record_tainted_rejection(self, node_id: str, parent_id: str, rejected_at_utc: str):
+    async def record_tainted_rejection(self, node_id: str, parent_id: str,
+                                       rejected_at_utc: str, author_identity: str = ""):
         async with self.lock:
             self._tainted_rejections.append({
                 "node_id": node_id,
                 "tainted_parent_id": parent_id,
                 "rejected_at_utc": rejected_at_utc,
+                "author_identity": author_identity,
                 "offered": False,
                 "offered_replacement": None,
                 "replacement_type": None,  # "direct" or "ancestor"
@@ -607,29 +610,43 @@ class MemoryStateBackend(BaseStateBackend):
     async def check_retry_completion(self, payload: dict) -> None:
         """Check if a newly admitted write completes a previously rejected action.
 
-        Completion is recognized when:
-        1. The payload declares retry_of pointing to a rejected node, OR
-        2. The payload's parent is a replacement_node_id from a prior offer.
+        Completion requires a structural match: the offered replacement_node_id
+        must appear among the payload's parents. This is verified against
+        Gateway-controlled state and cannot be forged by the submitter.
+
+        retry_of is stored as a provenance hint but does NOT by itself
+        trigger completion — otherwise the metric would be self-reported
+        by the party being measured.
+
+        When retry_of IS present, we additionally verify the submitting
+        identity matches the rejected write's author. A mismatched
+        identity is silently ignored (no completion credit).
+
+        A single admitted write can complete multiple previously-rejected
+        actions if it parents on a replacement that was offered to several
+        rejections.
         """
         async with self.lock:
             retry_of = payload.get("retry_of")
             parent_ids = [p["parent_node_id"] for p in payload.get("parent_dependency_commitments", [])]
+            submitter = payload.get("ephemeral_nhi", {}).get("identity_id", "")
 
             for r in self._tainted_rejections:
                 if r["completed"]:
                     continue
                 if not r["offered"]:
                     continue
-                # Match by explicit retry_of declaration
+                # Structural match: the offered replacement must be a parent.
+                if not (r["offered_replacement"] and r["offered_replacement"] in parent_ids):
+                    continue
+                # If retry_of is declared, verify identity matches the
+                # original author. Mismatch → skip (no credit for
+                # claiming someone else's workflow).
                 if retry_of and retry_of == r["node_id"]:
-                    r["completed"] = True
-                    r["completed_by"] = payload["payload_id"]
-                    break
-                # Match by parent being the offered replacement
-                if r["offered_replacement"] and r["offered_replacement"] in parent_ids:
-                    r["completed"] = True
-                    r["completed_by"] = payload["payload_id"]
-                    break
+                    if r["author_identity"] and submitter != r["author_identity"]:
+                        continue
+                r["completed"] = True
+                r["completed_by"] = payload["payload_id"]
 
     async def get_tainted_action_stats(self) -> dict:
         async with self.lock:
@@ -1328,7 +1345,8 @@ async def submit_candidate(request: Request):
                     await backend.record_tainted_rejection(
                         payload.get("payload_id", "unknown"),
                         poisoned_root,
-                        datetime.now(timezone.utc).isoformat() + "Z"
+                        datetime.now(timezone.utc).isoformat() + "Z",
+                        author_identity=payload.get("ephemeral_nhi", {}).get("identity_id", "")
                     )
 
                     # Check if continuity already produced a replacement

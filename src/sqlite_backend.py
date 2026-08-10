@@ -163,6 +163,7 @@ class SqliteStateBackend(BaseStateBackend):
                 node_id TEXT NOT NULL,
                 tainted_parent_id TEXT NOT NULL,
                 rejected_at_utc TEXT NOT NULL,
+                author_identity TEXT DEFAULT '',
                 served INTEGER DEFAULT 0,
                 served_by_exposure_id TEXT,
                 offered INTEGER DEFAULT 0,
@@ -806,11 +807,12 @@ class SqliteStateBackend(BaseStateBackend):
         return results
 
     # --- Tainted-action tracking (B.8) ---
-    async def record_tainted_rejection(self, node_id: str, parent_id: str, rejected_at_utc: str):
+    async def record_tainted_rejection(self, node_id: str, parent_id: str,
+                                       rejected_at_utc: str, author_identity: str = ""):
         async with self._connect() as db:
             await db.execute(
-                "INSERT INTO tainted_rejections (node_id, tainted_parent_id, rejected_at_utc) VALUES (?, ?, ?)",
-                (node_id, parent_id, rejected_at_utc)
+                "INSERT INTO tainted_rejections (node_id, tainted_parent_id, rejected_at_utc, author_identity) VALUES (?, ?, ?, ?)",
+                (node_id, parent_id, rejected_at_utc, author_identity)
             )
             await db.commit()
 
@@ -831,29 +833,32 @@ class SqliteStateBackend(BaseStateBackend):
             await db.commit()
 
     async def check_retry_completion(self, payload: dict) -> None:
+        """Structural match only: replacement must be among parents.
+        retry_of is a provenance hint; when present, identity is verified."""
         async with self._connect() as db:
             retry_of = payload.get("retry_of")
             parent_ids = [p["parent_node_id"] for p in payload.get("parent_dependency_commitments", [])]
+            submitter = payload.get("ephemeral_nhi", {}).get("identity_id", "")
 
-            # Fetch all offered but not-yet-completed rejections
             async with db.execute(
-                "SELECT node_id, offered_replacement FROM tainted_rejections WHERE offered = 1 AND completed = 0"
+                "SELECT node_id, offered_replacement, author_identity FROM tainted_rejections WHERE offered = 1 AND completed = 0"
             ) as cursor:
                 pending = await cursor.fetchall()
 
-            for node_id, offered_replacement in pending:
-                matched = False
+            completed_any = False
+            for node_id, offered_replacement, author_identity in pending:
+                if not (offered_replacement and offered_replacement in parent_ids):
+                    continue
                 if retry_of and retry_of == node_id:
-                    matched = True
-                elif offered_replacement and offered_replacement in parent_ids:
-                    matched = True
-                if matched:
-                    await db.execute(
-                        "UPDATE tainted_rejections SET completed = 1, completed_by = ? WHERE node_id = ? AND completed = 0",
-                        (payload["payload_id"], node_id)
-                    )
-                    await db.commit()
-                    break
+                    if author_identity and submitter != author_identity:
+                        continue
+                await db.execute(
+                    "UPDATE tainted_rejections SET completed = 1, completed_by = ? WHERE node_id = ? AND completed = 0",
+                    (payload["payload_id"], node_id)
+                )
+                completed_any = True
+            if completed_any:
+                await db.commit()
 
     async def get_tainted_action_stats(self) -> dict:
         async with self._connect() as db:

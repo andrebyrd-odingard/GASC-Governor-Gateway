@@ -265,6 +265,7 @@ class PostgresStateBackend(BaseStateBackend):
                 node_id TEXT NOT NULL,
                 tainted_parent_id TEXT NOT NULL,
                 rejected_at_utc TIMESTAMPTZ NOT NULL,
+                author_identity TEXT DEFAULT '',
                 served BOOLEAN DEFAULT FALSE,
                 served_by_exposure_id TEXT,
                 offered BOOLEAN DEFAULT FALSE,
@@ -873,12 +874,13 @@ class PostgresStateBackend(BaseStateBackend):
 
     # ---- Tainted-action tracking (B.8) ----
 
-    async def record_tainted_rejection(self, node_id: str, parent_id: str, rejected_at_utc: str):
+    async def record_tainted_rejection(self, node_id: str, parent_id: str,
+                                       rejected_at_utc: str, author_identity: str = ""):
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO tainted_rejections (node_id, tainted_parent_id, rejected_at_utc) VALUES ($1, $2, $3)",
-                node_id, parent_id, rejected_at_utc
+                "INSERT INTO tainted_rejections (node_id, tainted_parent_id, rejected_at_utc, author_identity) VALUES ($1, $2, $3, $4)",
+                node_id, parent_id, rejected_at_utc, author_identity
             )
 
     async def record_tainted_offer(self, rejection_node_id: str, replacement_node_id: str, replacement_type: str):
@@ -898,28 +900,30 @@ class PostgresStateBackend(BaseStateBackend):
             )
 
     async def check_retry_completion(self, payload: dict) -> None:
+        """Structural match only: replacement must be among parents.
+        retry_of is a provenance hint; when present, identity is verified."""
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             retry_of = payload.get("retry_of")
             parent_ids = [p["parent_node_id"] for p in payload.get("parent_dependency_commitments", [])]
+            submitter = payload.get("ephemeral_nhi", {}).get("identity_id", "")
 
             pending = await conn.fetch(
-                "SELECT node_id, offered_replacement FROM tainted_rejections WHERE offered = TRUE AND completed = FALSE"
+                "SELECT node_id, offered_replacement, author_identity FROM tainted_rejections WHERE offered = TRUE AND completed = FALSE"
             )
             for row in pending:
                 node_id = row["node_id"]
                 offered_replacement = row["offered_replacement"]
-                matched = False
+                author_identity = row["author_identity"] or ""
+                if not (offered_replacement and offered_replacement in parent_ids):
+                    continue
                 if retry_of and retry_of == node_id:
-                    matched = True
-                elif offered_replacement and offered_replacement in parent_ids:
-                    matched = True
-                if matched:
-                    await conn.execute(
-                        "UPDATE tainted_rejections SET completed = TRUE, completed_by = $1 WHERE node_id = $2 AND completed = FALSE",
-                        payload["payload_id"], node_id
-                    )
-                    break
+                    if author_identity and submitter != author_identity:
+                        continue
+                await conn.execute(
+                    "UPDATE tainted_rejections SET completed = TRUE, completed_by = $1 WHERE node_id = $2 AND completed = FALSE",
+                    payload["payload_id"], node_id
+                )
 
     async def get_tainted_action_stats(self) -> dict:
         pool = await self._get_pool()
