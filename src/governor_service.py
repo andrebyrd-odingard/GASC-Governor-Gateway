@@ -165,7 +165,11 @@ class BaseStateBackend(ABC):
     @abstractmethod
     async def record_tainted_rejection(self, node_id: str, parent_id: str, rejected_at_utc: str): pass
     @abstractmethod
-    async def record_tainted_completion(self, rejection_node_id: str, exposure_id: str): pass
+    async def record_tainted_offer(self, rejection_node_id: str, replacement_node_id: str, replacement_type: str): pass
+    @abstractmethod
+    async def record_tainted_completion(self, rejection_node_id: str, completed_by_node_id: str): pass
+    @abstractmethod
+    async def check_retry_completion(self, payload: dict) -> None: pass
     @abstractmethod
     async def get_tainted_action_stats(self) -> dict: pass
     @abstractmethod
@@ -574,25 +578,76 @@ class MemoryStateBackend(BaseStateBackend):
                 "node_id": node_id,
                 "tainted_parent_id": parent_id,
                 "rejected_at_utc": rejected_at_utc,
-                "served": False,
+                "offered": False,
+                "offered_replacement": None,
+                "replacement_type": None,  # "direct" or "ancestor"
+                "completed": False,
+                "completed_by": None,
             })
 
-    async def record_tainted_completion(self, rejection_node_id: str, exposure_id: str):
+    async def record_tainted_offer(self, rejection_node_id: str, replacement_node_id: str, replacement_type: str):
+        """Record that a replacement was offered at 403-time. Does NOT mark completed."""
         async with self.lock:
             for r in self._tainted_rejections:
-                if r["node_id"] == rejection_node_id and not r["served"]:
-                    r["served"] = True
-                    r["served_by_exposure_id"] = exposure_id
+                if r["node_id"] == rejection_node_id and not r["offered"]:
+                    r["offered"] = True
+                    r["offered_replacement"] = replacement_node_id
+                    r["replacement_type"] = replacement_type
+                    break
+
+    async def record_tainted_completion(self, rejection_node_id: str, completed_by_node_id: str):
+        """Record that the rejected action was actually completed via retry."""
+        async with self.lock:
+            for r in self._tainted_rejections:
+                if r["node_id"] == rejection_node_id and not r["completed"]:
+                    r["completed"] = True
+                    r["completed_by"] = completed_by_node_id
+                    break
+
+    async def check_retry_completion(self, payload: dict) -> None:
+        """Check if a newly admitted write completes a previously rejected action.
+
+        Completion is recognized when:
+        1. The payload declares retry_of pointing to a rejected node, OR
+        2. The payload's parent is a replacement_node_id from a prior offer.
+        """
+        async with self.lock:
+            retry_of = payload.get("retry_of")
+            parent_ids = [p["parent_node_id"] for p in payload.get("parent_dependency_commitments", [])]
+
+            for r in self._tainted_rejections:
+                if r["completed"]:
+                    continue
+                if not r["offered"]:
+                    continue
+                # Match by explicit retry_of declaration
+                if retry_of and retry_of == r["node_id"]:
+                    r["completed"] = True
+                    r["completed_by"] = payload["payload_id"]
+                    break
+                # Match by parent being the offered replacement
+                if r["offered_replacement"] and r["offered_replacement"] in parent_ids:
+                    r["completed"] = True
+                    r["completed_by"] = payload["payload_id"]
                     break
 
     async def get_tainted_action_stats(self) -> dict:
         async with self.lock:
             total = len(self._tainted_rejections)
-            served = sum(1 for r in self._tainted_rejections if r["served"])
+            offered = sum(1 for r in self._tainted_rejections if r["offered"])
+            completed = sum(1 for r in self._tainted_rejections if r["completed"])
+            direct_offered = sum(1 for r in self._tainted_rejections if r["offered"] and r["replacement_type"] == "direct")
+            ancestor_offered = sum(1 for r in self._tainted_rejections if r["offered"] and r["replacement_type"] == "ancestor")
+            direct_completed = sum(1 for r in self._tainted_rejections if r["completed"] and r["replacement_type"] == "direct")
+            ancestor_completed = sum(1 for r in self._tainted_rejections if r["completed"] and r["replacement_type"] == "ancestor")
             return {
                 "total_rejections": total,
-                "served_by_continuity": served,
-                "completion_rate": served / total if total > 0 else 0.0,
+                "offered": offered,
+                "completed": completed,
+                "completion_rate": completed / total if total > 0 else 0.0,
+                "offer_rate": offered / total if total > 0 else 0.0,
+                "direct": {"offered": direct_offered, "completed": direct_completed},
+                "ancestor": {"offered": ancestor_offered, "completed": ancestor_completed},
             }
 
     async def find_continuity_replacement(self, tainted_node_id: str) -> dict | None:
@@ -1283,11 +1338,15 @@ async def submit_candidate(request: Request):
                         tainted_event["replacement_node_id"] = replacement["replacement_node_id"]
                         tainted_event["replacement_for"] = replacement["replacement_for"]
                         tainted_event["replacement_mechanism"] = replacement["mechanism"]
-                        # Mark tainted rejection as served
-                        exposure_id = replacement.get("exposure_id") or f"substitute-{uuid.uuid4()}"
-                        await backend.record_tainted_completion(
+                        # Classify: direct = the immediate tainted parent was replaced;
+                        # ancestor = an upstream node was replaced, re-derivation needed.
+                        replacement_type = "direct" if replacement["replacement_for"] == poisoned_root else "ancestor"
+                        # Record offer — NOT completion. Completion requires
+                        # the agent to actually re-parent and land a write.
+                        await backend.record_tainted_offer(
                             payload.get("payload_id", "unknown"),
-                            exposure_id
+                            replacement["replacement_node_id"],
+                            replacement_type
                         )
                     else:
                         tainted_event["continuity_available"] = False
@@ -1352,6 +1411,8 @@ async def submit_candidate(request: Request):
                 policy_bundle_digest=settings.OPA_POLICY_BUNDLE or "none",
                 writer_identity=writer_identity
             )
+            # Check if this admitted write completes a previously rejected action
+            await backend.check_retry_completion(payload)
         return {"status": "success", "message": "State node committed to DAG."}
 
 @app.post("/declare-external-effect")

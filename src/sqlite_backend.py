@@ -164,7 +164,12 @@ class SqliteStateBackend(BaseStateBackend):
                 tainted_parent_id TEXT NOT NULL,
                 rejected_at_utc TEXT NOT NULL,
                 served INTEGER DEFAULT 0,
-                served_by_exposure_id TEXT
+                served_by_exposure_id TEXT,
+                offered INTEGER DEFAULT 0,
+                offered_replacement TEXT,
+                replacement_type TEXT,
+                completed INTEGER DEFAULT 0,
+                completed_by TEXT
             )''')
             
             await db.commit()
@@ -809,24 +814,71 @@ class SqliteStateBackend(BaseStateBackend):
             )
             await db.commit()
 
-    async def record_tainted_completion(self, rejection_node_id: str, exposure_id: str):
+    async def record_tainted_offer(self, rejection_node_id: str, replacement_node_id: str, replacement_type: str):
         async with self._connect() as db:
             await db.execute(
-                "UPDATE tainted_rejections SET served = 1, served_by_exposure_id = ? WHERE node_id = ? AND served = 0",
-                (exposure_id, rejection_node_id)
+                "UPDATE tainted_rejections SET offered = 1, offered_replacement = ?, replacement_type = ? WHERE node_id = ? AND offered = 0",
+                (replacement_node_id, replacement_type, rejection_node_id)
             )
             await db.commit()
+
+    async def record_tainted_completion(self, rejection_node_id: str, completed_by_node_id: str):
+        async with self._connect() as db:
+            await db.execute(
+                "UPDATE tainted_rejections SET completed = 1, completed_by = ? WHERE node_id = ? AND completed = 0",
+                (completed_by_node_id, rejection_node_id)
+            )
+            await db.commit()
+
+    async def check_retry_completion(self, payload: dict) -> None:
+        async with self._connect() as db:
+            retry_of = payload.get("retry_of")
+            parent_ids = [p["parent_node_id"] for p in payload.get("parent_dependency_commitments", [])]
+
+            # Fetch all offered but not-yet-completed rejections
+            async with db.execute(
+                "SELECT node_id, offered_replacement FROM tainted_rejections WHERE offered = 1 AND completed = 0"
+            ) as cursor:
+                pending = await cursor.fetchall()
+
+            for node_id, offered_replacement in pending:
+                matched = False
+                if retry_of and retry_of == node_id:
+                    matched = True
+                elif offered_replacement and offered_replacement in parent_ids:
+                    matched = True
+                if matched:
+                    await db.execute(
+                        "UPDATE tainted_rejections SET completed = 1, completed_by = ? WHERE node_id = ? AND completed = 0",
+                        (payload["payload_id"], node_id)
+                    )
+                    await db.commit()
+                    break
 
     async def get_tainted_action_stats(self) -> dict:
         async with self._connect() as db:
             async with db.execute("SELECT COUNT(*) FROM tainted_rejections") as cursor:
                 total = (await cursor.fetchone())[0]
-            async with db.execute("SELECT COUNT(*) FROM tainted_rejections WHERE served = 1") as cursor:
-                served = (await cursor.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM tainted_rejections WHERE offered = 1") as cursor:
+                offered = (await cursor.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM tainted_rejections WHERE completed = 1") as cursor:
+                completed = (await cursor.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM tainted_rejections WHERE offered = 1 AND replacement_type = 'direct'") as cursor:
+                direct_offered = (await cursor.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM tainted_rejections WHERE offered = 1 AND replacement_type = 'ancestor'") as cursor:
+                ancestor_offered = (await cursor.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM tainted_rejections WHERE completed = 1 AND replacement_type = 'direct'") as cursor:
+                direct_completed = (await cursor.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM tainted_rejections WHERE completed = 1 AND replacement_type = 'ancestor'") as cursor:
+                ancestor_completed = (await cursor.fetchone())[0]
         return {
             "total_rejections": total,
-            "served_by_continuity": served,
-            "completion_rate": served / total if total > 0 else 0.0,
+            "offered": offered,
+            "completed": completed,
+            "completion_rate": completed / total if total > 0 else 0.0,
+            "offer_rate": offered / total if total > 0 else 0.0,
+            "direct": {"offered": direct_offered, "completed": direct_completed},
+            "ancestor": {"offered": ancestor_offered, "completed": ancestor_completed},
         }
 
     async def find_continuity_replacement(self, tainted_node_id: str) -> dict | None:

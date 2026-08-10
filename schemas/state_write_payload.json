@@ -103,6 +103,10 @@
       "maximum": 1,
       "default": 0,
       "description": "Criticality weight for safe-continuity triggering. 0 = no continuity attempted on quarantine; >0 = continuity fires for this node's dependents."
+    },
+    "retry_of": {
+      "type": "string",
+      "description": "Optional. The payload_id of a previously rejected write that this submission retries after re-parenting onto clean lineage provided by continuity."
     }
   },
   "additionalProperties": false

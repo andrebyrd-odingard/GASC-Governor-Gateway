@@ -266,7 +266,12 @@ class PostgresStateBackend(BaseStateBackend):
                 tainted_parent_id TEXT NOT NULL,
                 rejected_at_utc TIMESTAMPTZ NOT NULL,
                 served BOOLEAN DEFAULT FALSE,
-                served_by_exposure_id TEXT
+                served_by_exposure_id TEXT,
+                offered BOOLEAN DEFAULT FALSE,
+                offered_replacement TEXT,
+                replacement_type TEXT,
+                completed BOOLEAN DEFAULT FALSE,
+                completed_by TEXT
             )''')
 
             await conn.execute(
@@ -876,23 +881,64 @@ class PostgresStateBackend(BaseStateBackend):
                 node_id, parent_id, rejected_at_utc
             )
 
-    async def record_tainted_completion(self, rejection_node_id: str, exposure_id: str):
+    async def record_tainted_offer(self, rejection_node_id: str, replacement_node_id: str, replacement_type: str):
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             await conn.execute(
-                "UPDATE tainted_rejections SET served = TRUE, served_by_exposure_id = $1 WHERE node_id = $2 AND served = FALSE",
-                exposure_id, rejection_node_id
+                "UPDATE tainted_rejections SET offered = TRUE, offered_replacement = $1, replacement_type = $2 WHERE node_id = $3 AND offered = FALSE",
+                replacement_node_id, replacement_type, rejection_node_id
             )
+
+    async def record_tainted_completion(self, rejection_node_id: str, completed_by_node_id: str):
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE tainted_rejections SET completed = TRUE, completed_by = $1 WHERE node_id = $2 AND completed = FALSE",
+                completed_by_node_id, rejection_node_id
+            )
+
+    async def check_retry_completion(self, payload: dict) -> None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            retry_of = payload.get("retry_of")
+            parent_ids = [p["parent_node_id"] for p in payload.get("parent_dependency_commitments", [])]
+
+            pending = await conn.fetch(
+                "SELECT node_id, offered_replacement FROM tainted_rejections WHERE offered = TRUE AND completed = FALSE"
+            )
+            for row in pending:
+                node_id = row["node_id"]
+                offered_replacement = row["offered_replacement"]
+                matched = False
+                if retry_of and retry_of == node_id:
+                    matched = True
+                elif offered_replacement and offered_replacement in parent_ids:
+                    matched = True
+                if matched:
+                    await conn.execute(
+                        "UPDATE tainted_rejections SET completed = TRUE, completed_by = $1 WHERE node_id = $2 AND completed = FALSE",
+                        payload["payload_id"], node_id
+                    )
+                    break
 
     async def get_tainted_action_stats(self) -> dict:
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             total = await conn.fetchval("SELECT COUNT(*) FROM tainted_rejections")
-            served = await conn.fetchval("SELECT COUNT(*) FROM tainted_rejections WHERE served = TRUE")
+            offered = await conn.fetchval("SELECT COUNT(*) FROM tainted_rejections WHERE offered = TRUE")
+            completed = await conn.fetchval("SELECT COUNT(*) FROM tainted_rejections WHERE completed = TRUE")
+            direct_offered = await conn.fetchval("SELECT COUNT(*) FROM tainted_rejections WHERE offered = TRUE AND replacement_type = 'direct'")
+            ancestor_offered = await conn.fetchval("SELECT COUNT(*) FROM tainted_rejections WHERE offered = TRUE AND replacement_type = 'ancestor'")
+            direct_completed = await conn.fetchval("SELECT COUNT(*) FROM tainted_rejections WHERE completed = TRUE AND replacement_type = 'direct'")
+            ancestor_completed = await conn.fetchval("SELECT COUNT(*) FROM tainted_rejections WHERE completed = TRUE AND replacement_type = 'ancestor'")
         return {
             "total_rejections": total,
-            "served_by_continuity": served,
-            "completion_rate": served / total if total > 0 else 0.0,
+            "offered": offered,
+            "completed": completed,
+            "completion_rate": completed / total if total > 0 else 0.0,
+            "offer_rate": offered / total if total > 0 else 0.0,
+            "direct": {"offered": direct_offered, "completed": direct_completed},
+            "ancestor": {"offered": ancestor_offered, "completed": ancestor_completed},
         }
 
     async def find_continuity_replacement(self, tainted_node_id: str) -> dict | None:

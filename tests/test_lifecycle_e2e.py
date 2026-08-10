@@ -324,13 +324,30 @@ def test_full_lifecycle():
     assert "replacement_node_id" in event_body, \
         f"403 should include replacement_node_id: {event_body}"
     assert event_body["replacement_for"] == "base-record"
+    replacement_node_id = event_body["replacement_node_id"]
 
-    # Tainted-action completion should now show served_by_continuity > 0
+    # At this point: offered=1, completed=0. Offer != completion.
     report_mid = client.get("/continuity-report", headers=_auth_headers("admin")).json()
     tainted_stats = report_mid["operational_footprint"]["authorized_tainted_action_completion"]
     assert tainted_stats["total_rejections"] >= 1
-    assert tainted_stats["served_by_continuity"] >= 1, \
-        f"Expected served_by_continuity >= 1, got {tainted_stats}"
+    assert tainted_stats["offered"] >= 1, f"Expected offered >= 1, got {tainted_stats}"
+    assert tainted_stats["completed"] == 0, \
+        f"Completion should be 0 before retry lands: {tainted_stats}"
+    assert tainted_stats["completion_rate"] == 0.0
+
+    # ===== Step 5b: Agent retries by re-parenting onto the replacement =====
+    # The agent re-submits its write building on the clean replacement node.
+    retry_write = _make_payload("retry-attempt", {"data": "wants clean lineage"},
+                                [replacement_node_id])
+    retry_write["retry_of"] = "tainted-attempt"
+    resp = client.post("/submit-candidate", json=retry_write)
+    assert resp.status_code == 200, f"Retry should succeed: {resp.status_code} {resp.json()}"
+
+    # NOW completion should be 1 — the retry actually landed.
+    report_post = client.get("/continuity-report", headers=_auth_headers("admin")).json()
+    tainted_stats = report_post["operational_footprint"]["authorized_tainted_action_completion"]
+    assert tainted_stats["completed"] >= 1, \
+        f"Expected completed >= 1 after retry: {tainted_stats}"
     assert tainted_stats["completion_rate"] > 0.0
 
     # ===== Step 6: Compaction resolved to REDUCIBLE (R3-R5) =====
