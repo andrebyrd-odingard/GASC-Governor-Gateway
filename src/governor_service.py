@@ -803,7 +803,15 @@ def verify_cryptographic_signature(payload: dict) -> bool:
         return False
 
 _wasm_engine_cache = {}
-_wasm_engine_lock = asyncio.Lock()
+_wasm_engine_lock = None
+
+
+def _get_wasm_lock():
+    """Lazy-init the WASM engine lock to avoid binding to an event loop at import time."""
+    global _wasm_engine_lock
+    if _wasm_engine_lock is None:
+        _wasm_engine_lock = asyncio.Lock()
+    return _wasm_engine_lock
 
 
 class PolicyEvaluationError(Exception):
@@ -814,15 +822,20 @@ class PolicyEvaluationError(Exception):
 async def evaluate_opa_policy(policy_package: str, query: str, input_data: dict) -> bool:
     if settings.OPA_POLICY_BUNDLE and os.path.exists(settings.OPA_POLICY_BUNDLE):
         if wasmtime and settings.OPA_POLICY_BUNDLE.endswith(".wasm"):
-            async with _wasm_engine_lock:
+            # wasmtime.Store is not safe for concurrent use. The lock must
+            # cover both initialization AND evaluation to prevent corruption
+            # when multiple admission coroutines call evaluate_opa_policy
+            # concurrently. At sub-100us per eval this serialization is
+            # acceptable; it replaces a 15ms subprocess spawn.
+            async with _get_wasm_lock():
                 if settings.OPA_POLICY_BUNDLE not in _wasm_engine_cache:
                     _wasm_engine_cache[settings.OPA_POLICY_BUNDLE] = OpaWasmEngine(settings.OPA_POLICY_BUNDLE)
-            engine = _wasm_engine_cache[settings.OPA_POLICY_BUNDLE]
+                engine = _wasm_engine_cache[settings.OPA_POLICY_BUNDLE]
 
-            try:
-                result = engine.evaluate(input_data, query)
-            except RuntimeError as e:
-                raise PolicyEvaluationError(f"WASM policy evaluation failed: {e}") from e
+                try:
+                    result = engine.evaluate(input_data, query)
+                except RuntimeError as e:
+                    raise PolicyEvaluationError(f"WASM policy evaluation failed: {e}") from e
 
             if not result:
                 raise PolicyEvaluationError("WASM returned empty result set")
@@ -830,6 +843,9 @@ async def evaluate_opa_policy(policy_package: str, query: str, input_data: dict)
             if isinstance(res, bool):
                 return res
             if isinstance(res, dict):
+                # Combined policy returns a multi-key dict — pass through
+                if "allow_state_write" in res and "allow_reintegration" in res:
+                    return res
                 if "allow_state_write" in res:
                     return res["allow_state_write"]
                 if "allow_reintegration" in res:
@@ -854,6 +870,9 @@ async def evaluate_opa_policy(policy_package: str, query: str, input_data: dict)
                 res = await client.post(f"{settings.OPA_URL}/v1/data/{policy_package}", json={"input": input_data})
                 if res.status_code == 200:
                     result = res.json().get("result", {})
+                    # Combined policy returns a multi-key dict — pass through
+                    if "allow_state_write" in result and "allow_reintegration" in result:
+                        return result
                     if "allow_state_write" in result: return result["allow_state_write"]
                     if "allow_reintegration" in result: return result["allow_reintegration"]
                     return False
@@ -925,18 +944,6 @@ async def evaluate_admission(payload: dict, parent_ids: List[str], exists_map: D
         ],
     }
 
-    is_integrity_valid = await evaluate_opa_policy(
-        "gasc/governor/integrity",
-        "data.gasc.governor.integrity.allow_state_write",
-        integrity_input
-    )
-    
-    if not is_integrity_valid:
-        tainted = [pid for pid in parent_ids if quarantined_map.get(pid)]
-        if tainted:
-            return {"admit": False, "reason": "TAINTED_PARENT", "poisoned_root": tainted[0]}
-        return {"admit": False, "reason": "Lineage or Monotonicity Invalid"}
-
     reintegration_input = {
         "candidate_submission": {
             "new_candidate_node_id": payload.get("payload_id"),
@@ -948,16 +955,55 @@ async def evaluate_admission(payload: dict, parent_ids: List[str], exists_map: D
         "request_timestamp_epoch": int(datetime.now(timezone.utc).timestamp()),
         "verifier_execution_status": auth_context.get("verifier_execution_status", "PENDING")
     }
-    
+
     if "justification" in payload.get("state_content", {}):
         reintegration_input["candidate_submission"]["justification"] = payload["state_content"]["justification"]
-        
+
+    # Try combined single-call evaluation first (halves OPA overhead).
+    # Falls back to two sequential calls if the combined policy is unavailable.
+    combined_input = {
+        "integrity": integrity_input,
+        "verification": reintegration_input,
+    }
+    try:
+        combined_result = await evaluate_opa_policy(
+            "gasc/governor/admission",
+            "data.gasc.governor.admission.result",
+            combined_input
+        )
+        # Combined policy returns a dict with allow_state_write, allow_reintegration, is_irreducible
+        if isinstance(combined_result, dict):
+            if not combined_result.get("allow_state_write", False):
+                tainted = [pid for pid in parent_ids if quarantined_map.get(pid)]
+                if tainted:
+                    return {"admit": False, "reason": "TAINTED_PARENT", "poisoned_root": tainted[0]}
+                return {"admit": False, "reason": "Lineage or Monotonicity Invalid"}
+            if not combined_result.get("allow_reintegration", False):
+                return {"admit": False, "reason": "Verification Separation Policy Failed"}
+            return {"admit": True}
+    except PolicyEvaluationError:
+        pass  # Fall through to sequential two-call path
+
+    # Sequential fallback: two separate OPA calls (for deployments without
+    # the combined policy bundle).
+    is_integrity_valid = await evaluate_opa_policy(
+        "gasc/governor/integrity",
+        "data.gasc.governor.integrity.allow_state_write",
+        integrity_input
+    )
+
+    if not is_integrity_valid:
+        tainted = [pid for pid in parent_ids if quarantined_map.get(pid)]
+        if tainted:
+            return {"admit": False, "reason": "TAINTED_PARENT", "poisoned_root": tainted[0]}
+        return {"admit": False, "reason": "Lineage or Monotonicity Invalid"}
+
     is_reintegration_valid = await evaluate_opa_policy(
         "gasc/governor/verification",
         "data.gasc.governor.verification.allow_reintegration",
         reintegration_input
     )
-    
+
     if not is_reintegration_valid:
         return {"admit": False, "reason": "Verification Separation Policy Failed"}
 
@@ -1752,6 +1798,17 @@ async def get_measured_cost(request: Request):
 
 @app.get("/readyz")
 async def readyz():
+    # In non-debug (production) mode, the gateway must have a fast policy
+    # evaluation path configured. The subprocess fallback spawns a new OPA
+    # process per call (~15ms p50, 500ms+ p99 at concurrency 50) and is
+    # only acceptable during local development.
+    if not settings.DEBUG_MODE:
+        if not settings.OPA_POLICY_BUNDLE and not settings.OPA_URL:
+            raise HTTPException(
+                status_code=503,
+                detail="No fast policy path configured. Set OPA_POLICY_BUNDLE (*.wasm preferred) or OPA_URL. "
+                       "Subprocess fallback is not production-ready."
+            )
     if settings.OPA_POLICY_BUNDLE and not os.path.exists(settings.OPA_POLICY_BUNDLE):
         raise HTTPException(status_code=503, detail="Policy bundle not found")
     return {"status": "ok", "enforcement_mode": settings.ENFORCEMENT_MODE}

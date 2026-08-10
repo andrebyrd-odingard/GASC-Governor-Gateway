@@ -43,7 +43,7 @@ def generate_designator_token():
     return jwt.encode({"sub": "designator", "role": "designator"}, JWT_PRIVATE_KEY_PEM, algorithm="ES256")
 
 
-def create_payload(payload_id, parent_id):
+def create_payload(payload_id, parent_id, parent_content_hash=None):
     session_token = jwt.encode(
         {
             "sub": PUBLIC_KEY_HEX,
@@ -60,6 +60,9 @@ def create_payload(payload_id, parent_id):
     actual_hash = hashlib.sha256(content_str.encode()).hexdigest()
     signature_hex = sk.sign(actual_hash.encode()).hex()
 
+    # Use provided parent_content_hash or default to "e"*64 for seed nodes
+    p_hash = parent_content_hash if parent_content_hash else "e" * 64
+
     return {
         "payload_id": payload_id,
         "timestamp_utc": "2026-10-27T10:00:00Z",
@@ -75,7 +78,7 @@ def create_payload(payload_id, parent_id):
         },
         "parent_dependency_commitments": [{
             "parent_node_id": parent_id,
-            "parent_content_hash": "e" * 64
+            "parent_content_hash": p_hash
         }],
         "state_content": state_content,
         "content_digest_sha256": actual_hash,
@@ -123,11 +126,13 @@ class TestMaxWithdrawalAmplification:
             assert resp.status_code == 200
 
             prev_id = "amp-root"
+            prev_hash = root_payload["content_digest_sha256"]
             for i in range(149):
-                node_payload = create_payload(f"amp-chain-{i}", prev_id)
+                node_payload = create_payload(f"amp-chain-{i}", prev_id, parent_content_hash=prev_hash)
                 resp = await async_client.post("/submit-candidate", json=node_payload)
                 assert resp.status_code == 200, f"Failed at chain node {i}: {resp.text}"
                 prev_id = f"amp-chain-{i}"
+                prev_hash = node_payload["content_digest_sha256"]
 
             # Now trigger recurrence on the root
             # process_recurrence computes blast_radius(amp-root) which will be 150 nodes
@@ -164,11 +169,13 @@ class TestMaxWithdrawalAmplification:
             assert resp.status_code == 200
 
             prev_id = "esc-root"
+            prev_hash = root_payload["content_digest_sha256"]
             for i in range(9):
-                node_payload = create_payload(f"esc-chain-{i}", prev_id)
+                node_payload = create_payload(f"esc-chain-{i}", prev_id, parent_content_hash=prev_hash)
                 resp = await async_client.post("/submit-candidate", json=node_payload)
                 assert resp.status_code == 200
                 prev_id = f"esc-chain-{i}"
+                prev_hash = node_payload["content_digest_sha256"]
 
             await process_recurrence(_backend(), "esc-root", "FUNCTIONAL_FAILURE", "test")
 
@@ -211,11 +218,13 @@ class TestMaxWithdrawalAmplification:
             assert resp.status_code == 200
 
             prev_id = "small-root"
+            prev_hash = root_payload["content_digest_sha256"]
             for i in range(4):
-                node_payload = create_payload(f"small-chain-{i}", prev_id)
+                node_payload = create_payload(f"small-chain-{i}", prev_id, parent_content_hash=prev_hash)
                 resp = await async_client.post("/submit-candidate", json=node_payload)
                 assert resp.status_code == 200
                 prev_id = f"small-chain-{i}"
+                prev_hash = node_payload["content_digest_sha256"]
 
             await process_recurrence(_backend(), "small-root", "FUNCTIONAL_FAILURE", "test")
 
@@ -262,15 +271,15 @@ class TestTransitiveWithdrawal:
             resp = await async_client.post("/submit-candidate", json=root)
             assert resp.status_code == 200
 
-            hop1 = create_payload("depth-hop1", "depth-root")
+            hop1 = create_payload("depth-hop1", "depth-root", parent_content_hash=root["content_digest_sha256"])
             resp = await async_client.post("/submit-candidate", json=hop1)
             assert resp.status_code == 200
 
-            hop2 = create_payload("depth-hop2", "depth-hop1")
+            hop2 = create_payload("depth-hop2", "depth-hop1", parent_content_hash=hop1["content_digest_sha256"])
             resp = await async_client.post("/submit-candidate", json=hop2)
             assert resp.status_code == 200
 
-            hop3 = create_payload("depth-hop3", "depth-hop2")
+            hop3 = create_payload("depth-hop3", "depth-hop2", parent_content_hash=hop2["content_digest_sha256"])
             resp = await async_client.post("/submit-candidate", json=hop3)
             assert resp.status_code == 200
 
@@ -309,12 +318,13 @@ class TestTransitiveWithdrawal:
             assert resp.status_code == 200
 
             for branch in ["fan-b1", "fan-b2", "fan-b3"]:
-                p = create_payload(branch, "fan-root")
+                p = create_payload(branch, "fan-root", parent_content_hash=root["content_digest_sha256"])
                 resp = await async_client.post("/submit-candidate", json=p)
                 assert resp.status_code == 200
 
+            fan_b1_hash = hashlib.sha256(json.dumps({"data": "node-fan-b1"}, sort_keys=True).encode()).hexdigest()
             for child in ["fan-c1", "fan-c2"]:
-                p = create_payload(child, "fan-b1")
+                p = create_payload(child, "fan-b1", parent_content_hash=fan_b1_hash)
                 resp = await async_client.post("/submit-candidate", json=p)
                 assert resp.status_code == 200
 
@@ -407,7 +417,7 @@ class TestRecurrenceRateLimits:
             # Build a graph that will exceed amplification (2 nodes > limit of 1)
             root = create_payload("rej-root", "clean-parent-1")
             await async_client.post("/submit-candidate", json=root)
-            child = create_payload("rej-child", "rej-root")
+            child = create_payload("rej-child", "rej-root", parent_content_hash=root["content_digest_sha256"])
             await async_client.post("/submit-candidate", json=child)
 
             designator_token = generate_designator_token()
