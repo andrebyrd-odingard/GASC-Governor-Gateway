@@ -310,7 +310,32 @@ def test_full_lifecycle():
     for s in substitutions:
         assert s["node_id"] not in q_ledger
 
-    # ===== Step 5: Compaction resolved to REDUCIBLE (R3-R5) =====
+    # ===== Step 5: Tainted write gets 403 with continuity replacement =====
+    # An agent tries to build on base-record (quarantined). The 403 should
+    # name the replacement node so the agent can re-parent.
+    tainted_write = _make_payload("tainted-attempt", {"data": "wants clean lineage"}, ["base-record"])
+    resp = client.post("/submit-candidate", json=tainted_write)
+    assert resp.status_code == 403, f"Expected 403, got {resp.status_code}"
+    detail = resp.json()["detail"]
+    assert detail["error"] == "TAINTED_PARENT"
+    event_body = detail["event"]
+    assert event_body.get("continuity_available") is True, \
+        f"403 should indicate continuity_available=True: {event_body}"
+    assert "replacement_node_id" in event_body, \
+        f"403 should include replacement_node_id: {event_body}"
+    assert event_body["replacement_for"] == "base-record"
+
+    # Tainted-action completion should now show served_by_continuity > 0
+    report_mid = client.get("/continuity-report", headers=_auth_headers("admin")).json()
+    tainted_stats = report_mid["operational_footprint"]["authorized_tainted_action_completion"]
+    assert tainted_stats["total_rejections"] >= 1
+    assert tainted_stats["served_by_continuity"] >= 1, \
+        f"Expected served_by_continuity >= 1, got {tainted_stats}"
+    assert tainted_stats["completion_rate"] > 0.0
+
+    # ===== Step 6: Compaction resolved to REDUCIBLE (R3-R5) =====
+    # Refresh DAG since tainted-attempt was committed for audit
+    dag = client.get("/db-state", headers=_auth_headers("admin")).json()["dag"]
     repair_candidates = client.get("/db-state", headers=_auth_headers("admin")).json().get("repair_candidates", {})
     assert "comp-node" in repair_candidates, f"comp-node not in repair_candidates: {list(repair_candidates.keys())}"
     rc = repair_candidates["comp-node"]
@@ -324,7 +349,7 @@ def test_full_lifecycle():
         assert p["parent_node_id"] not in c_p, \
             f"Reconstructed node parent {p['parent_node_id']} in blast radius"
 
-    # ===== Step 6: Recurrence signal -> withdrawal =====
+    # ===== Step 7: Recurrence signal -> withdrawal =====
     # Fire FUNCTIONAL_FAILURE against a node reachable from the poisoned root
     resp = client.post(
         "/observe",
@@ -342,7 +367,7 @@ def test_full_lifecycle():
     assert "base-record" in q_after
     assert "derived-record" in q_after
 
-    # ===== Step 7: Continuity report — row 4 exercised =====
+    # ===== Step 8: Continuity report — row 4 exercised =====
     report = client.get("/continuity-report", headers=_auth_headers("admin")).json()
     assert report["non_vacuity_met"] is True
     assert report["exercised_while_quarantine_non_empty"] > 0

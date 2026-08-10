@@ -168,6 +168,8 @@ class BaseStateBackend(ABC):
     async def record_tainted_completion(self, rejection_node_id: str, exposure_id: str): pass
     @abstractmethod
     async def get_tainted_action_stats(self) -> dict: pass
+    @abstractmethod
+    async def find_continuity_replacement(self, tainted_node_id: str) -> dict | None: pass
 
 class MemoryStateBackend(BaseStateBackend):
     def __init__(self):
@@ -273,6 +275,11 @@ class MemoryStateBackend(BaseStateBackend):
                     break
             
             for comp_node in affected_compactions:
+                # Skip nodes that already reached a terminal disposition
+                existing = self.repair_candidates.get(comp_node, {})
+                if existing.get("disposition") in ("REDUCIBLE", "IRREDUCIBLE"):
+                    continue
+
                 if semantic_rollback:
                     self.repair_candidates[comp_node] = {
                         "disposition": "IRREDUCIBLE",
@@ -587,6 +594,64 @@ class MemoryStateBackend(BaseStateBackend):
                 "served_by_continuity": served,
                 "completion_rate": served / total if total > 0 else 0.0,
             }
+
+    async def find_continuity_replacement(self, tainted_node_id: str) -> dict | None:
+        """Find a continuity replacement for tainted_node_id or any of its
+        quarantined ancestors.
+
+        Checks two sources in order for each candidate:
+        1. Continuity exposures (M3/M4 replay nodes whose state_content
+           references the candidate as 'original_target')
+        2. Pre-declared substitutes whose source is still admissible
+
+        Returns {"replacement_node_id": ..., "replacement_for": ..., ...}
+        or None.
+        """
+        async with self.lock:
+            # Build the set of quarantined ancestors to check (including
+            # the node itself). Walk parent edges while staying in
+            # quarantine to find the original poisoned root(s).
+            candidates = []
+            visited = set()
+            queue = [tainted_node_id]
+            while queue:
+                nid = queue.pop(0)
+                if nid in visited:
+                    continue
+                visited.add(nid)
+                if nid in self.quarantine_ledger:
+                    candidates.append(nid)
+                    node_data = self.dag.get(nid, {})
+                    for p in node_data.get("parent_dependency_commitments", []):
+                        queue.append(p["parent_node_id"])
+
+            for candidate in candidates:
+                # 1. Check fired continuity exposures
+                for exp in self._continuity_exposures:
+                    node_id = exp.get("node_id")
+                    node_data = self.dag.get(node_id, {})
+                    sc = node_data.get("state_content", {})
+                    if sc.get("original_target") == candidate:
+                        return {
+                            "replacement_node_id": node_id,
+                            "replacement_for": candidate,
+                            "exposure_id": exp.get("exposure_id"),
+                            "mechanism": exp.get("exposure_record", {}).get("mechanism", "unknown"),
+                        }
+
+                # 2. Check pre-declared substitutes
+                sub_decl = self._substitute_declarations.get(candidate)
+                if sub_decl:
+                    sub_source = sub_decl.get("substitute_source_id")
+                    if sub_source and sub_source in self.dag and sub_source not in self.quarantine_ledger:
+                        return {
+                            "replacement_node_id": sub_source,
+                            "replacement_for": candidate,
+                            "exposure_id": None,
+                            "mechanism": "M3_DECLARED_SUBSTITUTE",
+                        }
+
+        return None
 
 
 if settings.BACKEND_TYPE == "postgres":
@@ -1210,6 +1275,22 @@ async def submit_candidate(request: Request):
                         poisoned_root,
                         datetime.now(timezone.utc).isoformat() + "Z"
                     )
+
+                    # Check if continuity already produced a replacement
+                    replacement = await backend.find_continuity_replacement(poisoned_root)
+                    if replacement:
+                        tainted_event["continuity_available"] = True
+                        tainted_event["replacement_node_id"] = replacement["replacement_node_id"]
+                        tainted_event["replacement_for"] = replacement["replacement_for"]
+                        tainted_event["replacement_mechanism"] = replacement["mechanism"]
+                        # Mark tainted rejection as served
+                        exposure_id = replacement.get("exposure_id") or f"substitute-{uuid.uuid4()}"
+                        await backend.record_tainted_completion(
+                            payload.get("payload_id", "unknown"),
+                            exposure_id
+                        )
+                    else:
+                        tainted_event["continuity_available"] = False
                 # other non-admit cases do not commit; audit is handled outside
             else:
                 # REQ-001: Verify declared parent_content_hash matches stored content_digest_sha256

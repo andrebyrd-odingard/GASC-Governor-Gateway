@@ -426,6 +426,11 @@ class PostgresStateBackend(BaseStateBackend):
 
         pool = await self._get_pool()
         for comp_node in affected_compactions:
+            # Skip nodes that already reached a terminal disposition
+            existing = (await self.get_repair_candidates()).get(comp_node, {})
+            if existing.get("disposition") in ("REDUCIBLE", "IRREDUCIBLE"):
+                continue
+
             if semantic_rollback:
                 await self._set_repair_candidate(comp_node, {
                     "disposition": "IRREDUCIBLE",
@@ -889,6 +894,78 @@ class PostgresStateBackend(BaseStateBackend):
             "served_by_continuity": served,
             "completion_rate": served / total if total > 0 else 0.0,
         }
+
+    async def find_continuity_replacement(self, tainted_node_id: str) -> dict | None:
+        """Find a continuity replacement for tainted_node_id or any of its
+        quarantined ancestors."""
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            # Build quarantined ancestor chain (BFS up parent edges)
+            candidates = []
+            visited_set = set()
+            bfs_queue = [tainted_node_id]
+            while bfs_queue:
+                nid = bfs_queue.pop(0)
+                if nid in visited_set:
+                    continue
+                visited_set.add(nid)
+                q_check = await conn.fetchrow(
+                    "SELECT 1 FROM quarantine_ledger WHERE node_id = $1", nid
+                )
+                if q_check:
+                    candidates.append(nid)
+                    parents = await conn.fetch(
+                        "SELECT parent_id FROM edges WHERE child_id = $1", nid
+                    )
+                    for prow in parents:
+                        bfs_queue.append(prow["parent_id"])
+
+            exposures = await conn.fetch(
+                "SELECT exposure_id, node_id, exposure_record_json FROM continuity_exposures"
+            )
+
+            for candidate in candidates:
+                for exp in exposures:
+                    node_id = exp["node_id"]
+                    row = await conn.fetchrow(
+                        "SELECT payload_json FROM nodes WHERE node_id = $1", node_id
+                    )
+                    if row is None:
+                        continue
+                    state_content = row["payload_json"].get("state_content", {})
+                    if state_content.get("original_target") == candidate:
+                        exposure_record = exp["exposure_record_json"] or {}
+                        return {
+                            "replacement_node_id": node_id,
+                            "replacement_for": candidate,
+                            "exposure_id": exp["exposure_id"],
+                            "mechanism": exposure_record.get("mechanism", "unknown"),
+                        }
+
+                # Check pre-declared substitutes
+                sub_row = await conn.fetchrow(
+                    "SELECT declaration_json FROM substitute_declarations WHERE target_node_id = $1",
+                    candidate
+                )
+                if sub_row:
+                    sub_decl = json.loads(sub_row["declaration_json"]) if isinstance(sub_row["declaration_json"], str) else sub_row["declaration_json"]
+                    sub_source = sub_decl.get("substitute_source_id")
+                    if not sub_source:
+                        continue
+                    exists = await conn.fetchrow(
+                        "SELECT 1 FROM nodes WHERE node_id = $1", sub_source
+                    )
+                    quarantined = await conn.fetchrow(
+                        "SELECT 1 FROM quarantine_ledger WHERE node_id = $1", sub_source
+                    )
+                    if exists and not quarantined:
+                        return {
+                            "replacement_node_id": sub_source,
+                            "replacement_for": candidate,
+                            "exposure_id": None,
+                            "mechanism": "M3_DECLARED_SUBSTITUTE",
+                        }
+        return None
 
     # ---- Reset ----
 

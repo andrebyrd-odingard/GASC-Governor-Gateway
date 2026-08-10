@@ -143,30 +143,71 @@ def test_e2e_adversarial_injection_via_designate():
     assert "order-3" in event["computed_blast_radius_C_p"]
 
     # 5. Generate Audit Manifest for gasc-audit scoring
-    db_state = client.get("/db-state", headers={"Authorization": f"Bearer {generate_admin_token()}"}).json()
+    admin_headers = {"Authorization": f"Bearer {generate_admin_token()}"}
+    db_state = client.get("/db-state", headers=admin_headers).json()
+    continuity_report = client.get("/continuity-report", headers=admin_headers).json()
+    shadow_report = client.get("/shadow-report", headers=admin_headers).json()
 
-    # Pull real continuity exposures from the backend
-    continuity_report = client.get(
-        "/continuity-report",
-        headers={"Authorization": f"Bearer {generate_admin_token()}"},
-    ).json()
     real_exposures = continuity_report.get("exposures", [])
+    op_footprint = continuity_report.get("operational_footprint", {})
+    tainted_stats = op_footprint.get("authorized_tainted_action_completion", {})
 
-    # Pull tainted-action completion stats for measured cost
-    tainted_stats = continuity_report.get("operational_footprint", {}).get(
-        "authorized_tainted_action_completion", {}
+    # --- Derive measured_cost_report from real system counts ---
+    dag = db_state.get("dag", {})
+    q_ledger = db_state.get("quarantine_ledger", [])
+    q_events = db_state.get("quarantine_events", [])
+
+    # safety: count quarantine monotonicity violations (taint clears,
+    # quarantine reductions). The transitions array is cumulative; each
+    # step must be a superset of the previous. Zero violations -> 1.0.
+    safety_violations = 0
+    # We have one snapshot; in a real audit there'd be a series.
+    # Count prohibited-ancestry admissions: writes that landed despite
+    # a quarantined parent. In enforce mode this should be 0.
+    for nid, ndata in dag.items():
+        if nid in q_ledger:
+            continue
+        for p in ndata.get("parent_dependency_commitments", []):
+            if p["parent_node_id"] in q_ledger:
+                safety_violations += 1
+                break
+    safety_denominator = max(len(q_events), 1)
+    safety = 1.0 - (safety_violations / safety_denominator)
+
+    # availability: CFA from the continuity report (already computed)
+    availability = op_footprint.get("critical_function_availability", 0.0)
+
+    # coverage: fraction of admitted DAG nodes with cryptographic binding
+    # (signature + lineage). All admitted writes passed verification, so
+    # count how many have both fields present.
+    total_writes = len(dag)
+    verified_writes = sum(
+        1 for ndata in dag.values()
+        if ndata.get("agent_signature") and ndata.get("content_digest_sha256")
     )
-    cfa = continuity_report.get("operational_footprint", {}).get(
-        "critical_function_availability", 0.0
-    )
+    coverage = verified_writes / total_writes if total_writes > 0 else 0.0
+
+    # function_restoration: authorized-tainted-action completion rate
+    function_restoration = tainted_stats.get("completion_rate", 0.0)
+
+    # burden: fraction of rejected writes that were NOT tainted-parent
+    # (false-positive-like rejections from policy).
+    total_rejections = shadow_report.get("counterfactual_rejections", 0)
+    tainted_rejections = tainted_stats.get("total_rejections", 0)
+    non_tainted_rejections = max(total_rejections - tainted_rejections, 0)
+    burden = non_tainted_rejections / max(total_rejections, 1)
+
+    # recurrence: fraction of reintegrated nodes that were subsequently
+    # withdrawn. Zero withdrawals after reintegration -> 0.0.
+    recurrence = 0.0  # No reintegrated nodes were withdrawn in this scenario
 
     audit_manifest = {
         "enforcement_mode": db_state.get("enforcement_mode", "enforce"),
         "boundary_id": "BOUNDARY-TEST",
         "operating_envelope_declaration": "E2E Test Envelope",
-        "admitted_writes": list(db_state.get("dag", {}).values()),
-        "quarantine_incidents": db_state.get("quarantine_events", []),
-        "quarantine_transitions": [{"quarantine_set": db_state.get("quarantine_ledger", [])}],
+        "admitted_writes": list(dag.values()),
+        "quarantine_incidents": q_events,
+        "quarantine_transitions": [{"quarantine_set": q_ledger}],
         "continuity_exposures": real_exposures,
         "reconstruction_attempts": [{"declared_evidence_boundary": {"fixed_at_utc": "2026-10-27T10:20:00Z"}, "incident_detected_at_utc": "2026-10-27T10:15:00Z"}],
         "fault_injection_campaign": {
@@ -188,12 +229,12 @@ def test_e2e_adversarial_injection_via_designate():
             {"disposition": "IRREDUCIBLE"}
         ],
         "measured_cost_report": {
-            "safety": 1.0,
-            "availability": cfa,
-            "coverage": 1.0,
-            "function_restoration": tainted_stats.get("completion_rate", 0.0),
-            "burden": 0.0,
-            "recurrence": 0.0,
+            "safety": safety,
+            "availability": availability,
+            "coverage": coverage,
+            "function_restoration": function_restoration,
+            "burden": burden,
+            "recurrence": recurrence,
         }
     }
     

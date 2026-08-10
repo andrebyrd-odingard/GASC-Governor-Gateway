@@ -384,6 +384,17 @@ class SqliteStateBackend(BaseStateBackend):
                 semantic_rollback = await self.has_external_effects(c_p)
 
                 for comp_node in affected_compactions:
+                    # Skip nodes that already reached a terminal disposition
+                    async with db.execute(
+                        "SELECT candidate_json FROM repair_candidates WHERE node_id = ?",
+                        (comp_node,)
+                    ) as rc_cursor:
+                        rc_row = await rc_cursor.fetchone()
+                    if rc_row:
+                        existing = json.loads(rc_row[0])
+                        if existing.get("disposition") in ("REDUCIBLE", "IRREDUCIBLE"):
+                            continue
+
                     if semantic_rollback:
                         await self._set_repair_candidate(db, comp_node, {
                             "disposition": "IRREDUCIBLE",
@@ -817,3 +828,80 @@ class SqliteStateBackend(BaseStateBackend):
             "served_by_continuity": served,
             "completion_rate": served / total if total > 0 else 0.0,
         }
+
+    async def find_continuity_replacement(self, tainted_node_id: str) -> dict | None:
+        async with self._connect() as db:
+            # Build quarantined ancestor chain (BFS up parent edges)
+            candidates = []
+            visited_set = set()
+            bfs_queue = [tainted_node_id]
+            while bfs_queue:
+                nid = bfs_queue.pop(0)
+                if nid in visited_set:
+                    continue
+                visited_set.add(nid)
+                async with db.execute(
+                    "SELECT 1 FROM quarantine_ledger WHERE node_id = ?", (nid,)
+                ) as cursor:
+                    if await cursor.fetchone():
+                        candidates.append(nid)
+                        async with db.execute(
+                            "SELECT parent_id FROM edges WHERE child_id = ?", (nid,)
+                        ) as pcursor:
+                            for prow in await pcursor.fetchall():
+                                bfs_queue.append(prow[0])
+
+            # Check each candidate for continuity replacements
+            async with db.execute(
+                "SELECT exposure_id, node_id, exposure_record_json FROM continuity_exposures"
+            ) as cursor:
+                exposures = await cursor.fetchall()
+
+            for candidate in candidates:
+                for exposure_id, node_id, exposure_record_json in exposures:
+                    async with db.execute(
+                        "SELECT payload_json FROM nodes WHERE node_id = ?",
+                        (node_id,)
+                    ) as cursor:
+                        row = await cursor.fetchone()
+                    if row is None:
+                        continue
+                    payload = json.loads(row[0])
+                    state_content = payload.get("state_content", {})
+                    if state_content.get("original_target") == candidate:
+                        exposure_record = json.loads(exposure_record_json)
+                        return {
+                            "replacement_node_id": node_id,
+                            "replacement_for": candidate,
+                            "exposure_id": exposure_id,
+                            "mechanism": exposure_record.get("mechanism"),
+                        }
+
+                # Check pre-declared substitutes
+                async with db.execute(
+                    "SELECT declaration_json FROM substitute_declarations WHERE target_node_id = ?",
+                    (candidate,)
+                ) as cursor:
+                    sub_row = await cursor.fetchone()
+                if sub_row:
+                    sub_decl = json.loads(sub_row[0])
+                    sub_source = sub_decl.get("substitute_source_id")
+                    if not sub_source:
+                        continue
+                    async with db.execute(
+                        "SELECT 1 FROM nodes WHERE node_id = ?", (sub_source,)
+                    ) as cursor:
+                        exists = await cursor.fetchone()
+                    async with db.execute(
+                        "SELECT 1 FROM quarantine_ledger WHERE node_id = ?", (sub_source,)
+                    ) as cursor:
+                        quarantined = await cursor.fetchone()
+                    if exists and not quarantined:
+                        return {
+                            "replacement_node_id": sub_source,
+                            "replacement_for": candidate,
+                            "exposure_id": None,
+                            "mechanism": "M3_DECLARED_SUBSTITUTE",
+                        }
+
+        return None
