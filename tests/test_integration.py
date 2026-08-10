@@ -3,7 +3,7 @@ import json
 import hashlib
 import jwt
 from datetime import datetime, timezone
-from ecdsa import SigningKey, NIST256p
+from tests.conftest import ECDSASigner
 from fastapi.testclient import TestClient
 
 from tests.conftest import JWT_PRIVATE_KEY_PEM
@@ -12,9 +12,8 @@ from src.governor_service import app, settings
 client = TestClient(app)
 
 # 2. Generate Identity Keypair (ECDSA)
-sk = SigningKey.generate(curve=NIST256p)
-vk = sk.verifying_key
-PUBLIC_KEY_HEX = vk.to_string().hex()
+_signer = ECDSASigner()
+PUBLIC_KEY_HEX = _signer.public_key_hex
 
 def generate_admin_token():
     return jwt.encode({"sub": "admin", "role": "admin"}, JWT_PRIVATE_KEY_PEM, algorithm="ES256")
@@ -42,8 +41,7 @@ def create_valid_payload(parent_id="clean-parent-1"):
     actual_hash = hashlib.sha256(content_str.encode()).hexdigest()
 
     # Sign the actual hash
-    signature_bytes = sk.sign(actual_hash.encode())
-    signature_hex = signature_bytes.hex()
+    signature_hex = _signer.sign(actual_hash.encode())
 
     return {
         "payload_id": "payload-" + hashlib.md5(str(datetime.now()).encode()).hexdigest(),
@@ -64,7 +62,8 @@ def create_valid_payload(parent_id="clean-parent-1"):
         }],
         "state_content": state_content,
         "content_digest_sha256": actual_hash,
-        "agent_signature": signature_hex
+        "agent_signature": signature_hex,
+        "signature_algorithm": "ECDSA-P256-SHA256"
     }
 
 def test_integration_submit_valid_payload():
@@ -81,6 +80,7 @@ def test_integration_submit_valid_payload():
 def test_integration_submit_invalid_signature():
     payload = create_valid_payload()
     payload["agent_signature"] = "deadbeef" * 8  # invalid sig
+    payload["signature_algorithm"] = "ECDSA-P256-SHA256"
     response = client.post("/submit-candidate", json=payload)
     assert response.status_code == 401
     assert "Cryptographic signature verification failed" in response.json()["detail"]
@@ -95,8 +95,8 @@ def test_integration_submit_invalid_jwt():
 def test_integration_submit_jwt_identity_mismatch():
     payload = create_valid_payload()
     # Provide a different pubkey in the payload to spoof identity
-    sk2 = SigningKey.generate(curve=NIST256p)
-    payload["ephemeral_nhi"]["identity_id"] = sk2.verifying_key.to_string().hex()
+    _signer2 = ECDSASigner()
+    payload["ephemeral_nhi"]["identity_id"] = _signer2.public_key_hex
     
     response = client.post("/submit-candidate", json=payload)
     assert response.status_code == 401
@@ -129,7 +129,8 @@ def test_integration_submit_verification_failure():
     content_str = json.dumps(payload["state_content"], sort_keys=True)
     actual_hash = hashlib.sha256(content_str.encode()).hexdigest()
     payload["content_digest_sha256"] = actual_hash
-    payload["agent_signature"] = sk.sign(actual_hash.encode()).hex()
+    payload["agent_signature"] = _signer.sign(actual_hash.encode())
+    payload["signature_algorithm"] = "ECDSA-P256-SHA256"
     
     response = client.post("/submit-candidate", json=payload)
     

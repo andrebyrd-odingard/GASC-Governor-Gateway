@@ -4,15 +4,14 @@ import hashlib
 import jwt
 from datetime import datetime, timezone
 from fastapi.testclient import TestClient
-from ecdsa import SigningKey, NIST256p
+from tests.conftest import JWT_PRIVATE_KEY_PEM, ECDSASigner
 
-from tests.conftest import JWT_PRIVATE_KEY_PEM
 from src.governor_service import app, settings
 
 client = TestClient(app)
 
-sk = SigningKey.generate(curve=NIST256p)
-PUBLIC_KEY_HEX = sk.verifying_key.to_string().hex()
+_signer = ECDSASigner()
+PUBLIC_KEY_HEX = _signer.public_key_hex
 
 def generate_admin_token():
     return jwt.encode(
@@ -48,7 +47,7 @@ def create_payload(payload_id, parent_id, state_content, parent_content_hash=Non
 
     content_str = json.dumps(state_content, sort_keys=True)
     actual_hash = hashlib.sha256(content_str.encode()).hexdigest()
-    signature_hex = sk.sign(actual_hash.encode()).hex()
+    signature_hex = _signer.sign(actual_hash.encode())
 
     return {
         "payload_id": payload_id,
@@ -69,7 +68,8 @@ def create_payload(payload_id, parent_id, state_content, parent_content_hash=Non
         }],
         "state_content": state_content,
         "content_digest_sha256": actual_hash,
-        "agent_signature": signature_hex
+        "agent_signature": signature_hex,
+        "signature_algorithm": "ECDSA-P256-SHA256"
     }
 
 def test_e2e_adversarial_injection_via_designate():

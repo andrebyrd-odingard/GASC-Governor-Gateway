@@ -3,7 +3,6 @@ import jwt
 import json
 import hashlib
 from datetime import datetime, timezone
-from ecdsa import SigningKey, NIST256p
 from httpx import AsyncClient
 
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -12,12 +11,11 @@ from cryptography.hazmat.primitives import serialization
 from src.governor_service import app, backend
 from src.config import settings
 
-from tests.conftest import JWT_PRIVATE_KEY_PEM, JWT_PUBLIC_KEY
+from tests.conftest import JWT_PRIVATE_KEY_PEM, JWT_PUBLIC_KEY, ECDSASigner
 
 # Generate Identity Keypair (ECDSA)
-sk = SigningKey.generate(curve=NIST256p)
-vk = sk.verifying_key
-PUBLIC_KEY_HEX = vk.to_string().hex()
+_signer = ECDSASigner()
+PUBLIC_KEY_HEX = _signer.public_key_hex
 
 
 @pytest.fixture
@@ -49,8 +47,7 @@ def create_valid_payload(node_id, session_token, state_content):
     content_str = json.dumps(state_content, sort_keys=True)
     actual_hash = hashlib.sha256(content_str.encode()).hexdigest()
     
-    signature_bytes = sk.sign(actual_hash.encode())
-    signature_hex = signature_bytes.hex()
+    signature_hex = _signer.sign(actual_hash.encode())
     
     return {
         "payload_id": node_id,
@@ -70,7 +67,8 @@ def create_valid_payload(node_id, session_token, state_content):
         ],
         "state_content": state_content,
         "content_digest_sha256": actual_hash,
-        "agent_signature": signature_hex
+        "agent_signature": signature_hex,
+        "signature_algorithm": "ECDSA-P256-SHA256"
     }
 
 @pytest.mark.asyncio
@@ -92,7 +90,7 @@ async def test_context_compacted_endpoint(auth_headers, admin_headers):
     compaction_state = {"summary": "User said hello"}
     c_str = json.dumps(compaction_state, sort_keys=True)
     c_hash = hashlib.sha256(c_str.encode()).hexdigest()
-    c_sig = sk.sign(c_hash.encode()).hex()
+    c_sig = _signer.sign(c_hash.encode())
     
     compaction_event = {
         "compacted_node_ids": ["test-node-1"],
@@ -100,7 +98,8 @@ async def test_context_compacted_endpoint(auth_headers, admin_headers):
         "timestamp_utc": datetime.now(timezone.utc).isoformat() + "Z",
         "ephemeral_nhi": payload["ephemeral_nhi"],
         "state_content": compaction_state,
-        "agent_signature": c_sig
+        "agent_signature": c_sig,
+        "signature_algorithm": "ECDSA-P256-SHA256"
     }
     
     async with AsyncClient(app=app, base_url="http://test") as ac:
@@ -147,7 +146,7 @@ async def test_semantic_rollback_hazard(auth_headers, admin_headers):
     compaction_state = {"summary": "User said hello"}
     c_str = json.dumps(compaction_state, sort_keys=True)
     c_hash = hashlib.sha256(c_str.encode()).hexdigest()
-    c_sig = sk.sign(c_hash.encode()).hex()
+    c_sig = _signer.sign(c_hash.encode())
     
     compaction_event = {
         "compacted_node_ids": ["test-node-1"],
@@ -155,7 +154,8 @@ async def test_semantic_rollback_hazard(auth_headers, admin_headers):
         "timestamp_utc": datetime.now(timezone.utc).isoformat() + "Z",
         "ephemeral_nhi": payload["ephemeral_nhi"],
         "state_content": compaction_state,
-        "agent_signature": c_sig
+        "agent_signature": c_sig,
+        "signature_algorithm": "ECDSA-P256-SHA256"
     }
     
     async with AsyncClient(app=app, base_url="http://test") as ac:

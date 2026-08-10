@@ -70,6 +70,7 @@ class ContextCompactedEvent(BaseModel):
     ephemeral_nhi: dict
     state_content: dict
     agent_signature: str
+    signature_algorithm: str = "ECDSA-P256-SHA256"
     method_id: str = "llm_summary"
 
 
@@ -795,9 +796,7 @@ def verify_cryptographic_signature(payload: dict) -> bool:
     try:
         public_key = _load_public_key(public_key_hex)
         der_sig = _raw_signature_to_der(signature_hex)
-        # Existing ecdsa signatures were produced with the library's default
-        # hash function (SHA-1).  Retain that for verification compatibility.
-        public_key.verify(der_sig, actual_hash.encode(), ec.ECDSA(hashes.SHA1()))
+        public_key.verify(der_sig, actual_hash.encode(), ec.ECDSA(hashes.SHA256()))
         return True
     except Exception:
         return False
@@ -1020,8 +1019,21 @@ async def submit_candidate(request: Request):
     try:
         PAYLOAD_SCHEMA_VALIDATOR.validate(payload)
     except ValidationError as e:
+        if "signature_algorithm" in str(e.path) or "signature_algorithm" in e.message:
+            raise HTTPException(
+                status_code=400,
+                detail="signature_algorithm is required and must be 'ECDSA-P256-SHA256'. "
+                       "Signatures produced with SHA-1 (the ecdsa library default) are no longer accepted."
+            )
         raise HTTPException(status_code=400, detail=f"Schema validation failed: {e.message}")
-        
+
+    sig_alg = payload.get("signature_algorithm")
+    if sig_alg != "ECDSA-P256-SHA256":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported signature_algorithm '{sig_alg}'. Only 'ECDSA-P256-SHA256' is accepted."
+        )
+
     token = payload.get("ephemeral_nhi", {}).get("session_token")
     identity_id = payload.get("ephemeral_nhi", {}).get("identity_id")
     auth_context = verify_nhi_jwt(token, identity_id)
@@ -1209,6 +1221,7 @@ async def declare_context_compacted(event: ContextCompactedEvent, request: Reque
         "state_content": event.state_content,
         "content_digest_sha256": actual_hash,
         "agent_signature": event.agent_signature,
+        "signature_algorithm": event.signature_algorithm,
         "covers": event.compacted_node_ids,
         "parent_dependency_commitments": parent_commitments,
         "summarizer": {
@@ -1338,9 +1351,13 @@ async def designate_poison(event: DesignationEvent, request: Request):
                 else:
                     # REQ-009: Inline reconstruction fallback — enables the
                     # reducible path without requiring an external adapter.
-                    from ecdsa import SigningKey, NIST256p
-                    inline_sk = SigningKey.generate(curve=NIST256p)
-                    inline_pub = inline_sk.verifying_key.to_string().hex()
+                    from cryptography.hazmat.primitives.asymmetric import utils as asy_utils
+                    inline_private_key = ec.generate_private_key(ec.SECP256R1())
+                    inline_pub_numbers = inline_private_key.public_key().public_numbers()
+                    inline_pub = (
+                        inline_pub_numbers.x.to_bytes(32, "big")
+                        + inline_pub_numbers.y.to_bytes(32, "big")
+                    ).hex()
 
                     candidate_id = f"reconstructed-{uuid.uuid4()}"
                     frontier = rc_data["frontier"]
@@ -1348,7 +1365,11 @@ async def designate_poison(event: DesignationEvent, request: Request):
                     state_content = {"data": json.dumps(checkpoint_data), "reconstructed": True}
                     content_str = json.dumps(state_content, sort_keys=True)
                     content_hash = hashlib.sha256(content_str.encode()).hexdigest()
-                    sig = inline_sk.sign(content_hash.encode()).hex()
+                    der_sig = inline_private_key.sign(
+                        content_hash.encode(), ec.ECDSA(hashes.SHA256())
+                    )
+                    r, s = asy_utils.decode_dss_signature(der_sig)
+                    sig = (r.to_bytes(32, "big") + s.to_bytes(32, "big")).hex()
 
                     candidate = {
                         "payload_id": candidate_id,
@@ -1360,6 +1381,7 @@ async def designate_poison(event: DesignationEvent, request: Request):
                         "covers": frontier,
                         "content_digest_sha256": content_hash,
                         "agent_signature": sig,
+                        "signature_algorithm": "ECDSA-P256-SHA256",
                         "ephemeral_nhi": {"identity_id": inline_pub, "session_token": "inline_adapter"},
                     }
                     # Auto-configure the public key for this inline adapter
@@ -1517,7 +1539,7 @@ async def observe_recurrence(event: ObserveEvent, request: Request):
         try:
             public_key = _load_public_key(adapter_key)
             der_sig = _raw_signature_to_der(event.adapter_signature)
-            public_key.verify(der_sig, event.node_id.encode(), ec.ECDSA(hashes.SHA1()))
+            public_key.verify(der_sig, event.node_id.encode(), ec.ECDSA(hashes.SHA256()))
         except Exception:
             raise HTTPException(status_code=403, detail="Invalid adapter signature")
 

@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 from src.governor_service import app, backend
 import json
 import httpx
-from ecdsa import SigningKey, NIST256p
+from tests.conftest import ECDSASigner
 from unittest.mock import patch, MagicMock
 
 @pytest.fixture(autouse=True)
@@ -81,11 +81,10 @@ def test_observe_endpoint_verification():
     assert "adapter_signature required" in res.text
     
     # 4. Valid signature
-    sk = SigningKey.generate(curve=NIST256p)
-    vk = sk.get_verifying_key()
-    settings.RECOVERY_ADAPTER_PUBLIC_KEY = vk.to_string().hex()
+    adapter_signer = ECDSASigner()
+    settings.RECOVERY_ADAPTER_PUBLIC_KEY = adapter_signer.public_key_hex
     
-    sig = sk.sign("n1".encode()).hex()
+    sig = adapter_signer.sign("n1".encode())
     res = client.post("/observe", json={
         "node_id": "n1",
         "recurrence_class": "VERIFIER_CONTRADICTION",

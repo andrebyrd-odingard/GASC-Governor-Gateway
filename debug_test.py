@@ -24,6 +24,7 @@ def test_debug():
         "parent_dependency_commitments": [],
         "content_digest_sha256": "dummy",
         "agent_signature": "dummy",
+        "signature_algorithm": "ECDSA-P256-SHA256",
         "state_content": {}
     }
 

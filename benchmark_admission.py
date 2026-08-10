@@ -27,6 +27,7 @@ payload = {
     "parent_dependency_commitments": [{"parent_node_id": "p1", "parent_content_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}],
     "content_digest_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     "agent_signature": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "signature_algorithm": "ECDSA-P256-SHA256",
     "state_content": {}
 }
 

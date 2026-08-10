@@ -22,18 +22,17 @@ import jwt
 import json
 import hashlib
 import numpy as np
-from ecdsa import SigningKey, NIST256p
 from httpx import AsyncClient, ASGITransport
 
-from tests.conftest import JWT_PRIVATE_KEY_PEM, JWT_PUBLIC_KEY
+from tests.conftest import JWT_PRIVATE_KEY_PEM, JWT_PUBLIC_KEY, ECDSASigner
 from src.governor_service import app, backend, settings
 import src.governor_service as gs
 
 
 pytestmark = [pytest.mark.slow, pytest.mark.skipif(not JWT_PUBLIC_KEY, reason="JWT keys not configured")]
 
-sk = SigningKey.generate(curve=NIST256p)
-PUBLIC_KEY_HEX = sk.verifying_key.to_string().hex()
+_signer = ECDSASigner()
+PUBLIC_KEY_HEX = _signer.public_key_hex
 
 
 def _admin_token():
@@ -56,7 +55,7 @@ def _valid_payload(seq: int):
     state_content = {"data": f"bench-{seq}"}
     content_str = json.dumps(state_content, sort_keys=True)
     actual_hash = hashlib.sha256(content_str.encode()).hexdigest()
-    signature_hex = sk.sign(actual_hash.encode()).hex()
+    signature_hex = _signer.sign(actual_hash.encode())
 
     return {
         "payload_id": f"bench-payload-{seq}",
@@ -77,7 +76,8 @@ def _valid_payload(seq: int):
         }],
         "state_content": state_content,
         "content_digest_sha256": actual_hash,
-        "agent_signature": signature_hex
+        "agent_signature": signature_hex,
+        "signature_algorithm": "ECDSA-P256-SHA256"
     }
 
 

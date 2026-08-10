@@ -31,7 +31,8 @@ def get_valid_state_write_payload():
         }],
         "state_content": {"key": "value"},
         "content_digest_sha256": "d" * 64,
-        "agent_signature": "c" * 64
+        "agent_signature": "c" * 64,
+        "signature_algorithm": "ECDSA-P256-SHA256"
     }
 
 def test_valid_payload_passes_validation():

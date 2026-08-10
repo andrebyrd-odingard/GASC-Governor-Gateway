@@ -1,6 +1,6 @@
 import os
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec, utils as asy_utils
+from cryptography.hazmat.primitives import hashes, serialization
 
 if "JWT_PUBLIC_KEY" not in os.environ:
     jwt_private_key = ec.generate_private_key(ec.SECP256R1())
@@ -119,3 +119,24 @@ def backend_setup(request, monkeypatch, tmp_path):
 
 from src.config import settings
 settings.ENFORCEMENT_MODE = 'enforce'
+
+
+# --- Signing helper: single source of truth for ECDSA-P256-SHA256 ---
+# Every test that produces a signature imports this. The library default
+# can never leak back in because no test imports ecdsa directly.
+
+class ECDSASigner:
+    """ECDSA-P256-SHA256 signer. Raw r||s hex output, 64-byte uncompressed public key hex."""
+
+    def __init__(self, private_key=None):
+        self._private_key = private_key or ec.generate_private_key(ec.SECP256R1())
+        pub = self._private_key.public_key().public_numbers()
+        self.public_key_hex = (
+            pub.x.to_bytes(32, "big") + pub.y.to_bytes(32, "big")
+        ).hex()
+
+    def sign(self, message: bytes) -> str:
+        """Sign message bytes with ECDSA-P256-SHA256, return raw r||s hex."""
+        der = self._private_key.sign(message, ec.ECDSA(hashes.SHA256()))
+        r, s = asy_utils.decode_dss_signature(der)
+        return (r.to_bytes(32, "big") + s.to_bytes(32, "big")).hex()

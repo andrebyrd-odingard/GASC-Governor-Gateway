@@ -16,7 +16,21 @@ import hashlib
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.config import settings
-from ecdsa import SigningKey, NIST256p
+from cryptography.hazmat.primitives.asymmetric import ec, utils as asy_utils
+from cryptography.hazmat.primitives import hashes
+
+
+def _ecdsa_sign_sha256(private_key, message: bytes) -> str:
+    """Sign with ECDSA-P256-SHA256, return raw r||s hex."""
+    der = private_key.sign(message, ec.ECDSA(hashes.SHA256()))
+    r, s = asy_utils.decode_dss_signature(der)
+    return (r.to_bytes(32, "big") + s.to_bytes(32, "big")).hex()
+
+
+def _public_key_hex(private_key) -> str:
+    """Export raw 64-byte uncompressed public key hex (no 0x04 prefix)."""
+    pub = private_key.public_key().public_numbers()
+    return (pub.x.to_bytes(32, "big") + pub.y.to_bytes(32, "big")).hex()
 
 
 def make_payload(payload_id, parents, sk, content=None):
@@ -24,9 +38,8 @@ def make_payload(payload_id, parents, sk, content=None):
     content = content or {"calibration": True, "id": payload_id}
     content_json = json.dumps(content, sort_keys=True)
     content_hash = hashlib.sha256(content_json.encode()).hexdigest()
-    sig = sk.sign(content_json.encode()).hex()
-    vk = sk.get_verifying_key()
-    identity_id = vk.to_string().hex()
+    sig = _ecdsa_sign_sha256(sk, content_hash.encode())
+    identity_id = _public_key_hex(sk)
     now = datetime.datetime.now(datetime.timezone.utc)
 
     token = jwt.encode(
@@ -60,6 +73,7 @@ def make_payload(payload_id, parents, sk, content=None):
         "state_content": content,
         "content_digest_sha256": content_hash,
         "agent_signature": sig,
+        "signature_algorithm": "ECDSA-P256-SHA256",
     }
 
 
@@ -73,9 +87,8 @@ async def run_calibration():
     5. Check whether B (reintegrated) was withdrawn.
     6. Compute sensitivity floor and record via /calibrate.
     """
-    sk = SigningKey.generate(curve=NIST256p)
-    vk = sk.get_verifying_key()
-    adapter_pub = vk.to_string().hex()
+    sk = ec.generate_private_key(ec.SECP256R1())
+    adapter_pub = _public_key_hex(sk)
 
     admin_token = jwt.encode(
         {"sub": "calibrator", "role": "admin"},
@@ -132,8 +145,7 @@ async def run_calibration():
                 "evidence": {"seeded": True, "class": rc_class},
             }
             if rc_class == "VERIFIER_CONTRADICTION":
-                sig = sk.sign(target_id.encode()).hex()
-                observe_body["adapter_signature"] = sig
+                observe_body["adapter_signature"] = _ecdsa_sign_sha256(sk, target_id.encode())
 
             seeded += 1
             try:

@@ -1,7 +1,8 @@
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
-from ecdsa import SigningKey, NIST256p
+from cryptography.hazmat.primitives.asymmetric import ec, utils as asy_utils
+from cryptography.hazmat.primitives import hashes, serialization
 import json
 import hashlib
 import uuid
@@ -15,11 +16,16 @@ class Settings(BaseSettings):
 settings = Settings()
 
 if settings.ADAPTER_PRIVATE_KEY:
-    signing_key = SigningKey.from_string(bytes.fromhex(settings.ADAPTER_PRIVATE_KEY), curve=NIST256p)
+    # Raw 32-byte scalar hex — reconstruct the private key
+    _scalar = int(settings.ADAPTER_PRIVATE_KEY, 16)
+    signing_key = ec.derive_private_key(_scalar, ec.SECP256R1())
 else:
-    signing_key = SigningKey.generate(curve=NIST256p)
+    signing_key = ec.generate_private_key(ec.SECP256R1())
 
-public_key_hex = signing_key.verifying_key.to_string().hex()
+_pub_numbers = signing_key.public_key().public_numbers()
+public_key_hex = (
+    _pub_numbers.x.to_bytes(32, "big") + _pub_numbers.y.to_bytes(32, "big")
+).hex()
 print(f"STARTING RECOVERY ADAPTER with PUBLIC KEY: {public_key_hex}")
 
 app = FastAPI()
@@ -114,9 +120,11 @@ async def reconstruct(req: ReconstructRequest):
     content_str = json.dumps(state_content, sort_keys=True)
     actual_hash = hashlib.sha256(content_str.encode()).hexdigest()
     candidate["content_digest_sha256"] = actual_hash
-    
-    signature = signing_key.sign(actual_hash.encode())
-    candidate["agent_signature"] = signature.hex()
+
+    der_sig = signing_key.sign(actual_hash.encode(), ec.ECDSA(hashes.SHA256()))
+    r, s = asy_utils.decode_dss_signature(der_sig)
+    candidate["agent_signature"] = (r.to_bytes(32, "big") + s.to_bytes(32, "big")).hex()
+    candidate["signature_algorithm"] = "ECDSA-P256-SHA256"
     
     return {"candidate": candidate}
 

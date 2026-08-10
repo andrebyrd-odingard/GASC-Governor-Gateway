@@ -57,6 +57,7 @@ def submit_agent_action_to_governor(agent_id: str, action_data: dict, parent_nod
 
     # 3. Agent cryptographically signs the payload
     payload["agent_signature"] = sign_payload(payload, "agent_private_key")
+    payload["signature_algorithm"] = "ECDSA-P256-SHA256"
 
     print(f"[*] Agent {agent_id} submitting payload {payload_id} to Governor...")
     

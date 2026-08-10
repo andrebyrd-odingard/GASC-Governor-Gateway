@@ -32,6 +32,7 @@ def test_submit_candidate_no_dag_load():
         "parent_dependency_commitments": [{"parent_node_id": "p1", "parent_content_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}],
         "content_digest_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         "agent_signature": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "signature_algorithm": "ECDSA-P256-SHA256",
         "state_content": {}
     }
 
@@ -94,6 +95,7 @@ def test_submit_candidate_quarantined_parent_refused():
         "parent_dependency_commitments": [{"parent_node_id": "q1", "parent_content_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}],
         "content_digest_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         "agent_signature": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "signature_algorithm": "ECDSA-P256-SHA256",
         "state_content": {}
     }
     

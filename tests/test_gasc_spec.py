@@ -62,7 +62,8 @@ def test_schema_state_write_payload_valid():
         ],
         "state_content": {"key": "value"},
         "content_digest_sha256": "c" * 64,
-        "agent_signature": "signature"
+        "agent_signature": "signature",
+        "signature_algorithm": "ECDSA-P256-SHA256"
     }
     validate(instance=valid_payload, schema=schema)
 

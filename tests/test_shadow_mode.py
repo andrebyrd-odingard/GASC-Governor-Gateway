@@ -4,11 +4,9 @@ import hashlib
 import jwt
 from datetime import datetime, timezone
 from fastapi.testclient import TestClient
-from ecdsa import SigningKey, NIST256p
-
 from tests.conftest import JWT_PRIVATE_KEY_PEM
 from src.governor_service import app, settings
-from tests.test_integration import create_valid_payload, sk
+from tests.test_integration import create_valid_payload, _signer
 
 client = TestClient(app)
 
@@ -33,6 +31,7 @@ def reset_db():
 def test_shadow_mode_invalid_signature_is_blocked():
     payload = create_valid_payload()
     payload["agent_signature"] = "bad"
+    payload["signature_algorithm"] = "ECDSA-P256-SHA256"
     
     response = client.post("/submit-candidate", json=payload)
     assert response.status_code == 401
@@ -66,7 +65,8 @@ def test_shadow_mode_policy_violation_admitted_and_recorded():
     content_str = json.dumps(payload2["state_content"], sort_keys=True)
     actual_hash = hashlib.sha256(content_str.encode()).hexdigest()
     payload2["content_digest_sha256"] = actual_hash
-    payload2["agent_signature"] = sk.sign(actual_hash.encode()).hex()
+    payload2["agent_signature"] = _signer.sign(actual_hash.encode())
+    payload2["signature_algorithm"] = "ECDSA-P256-SHA256"
     
     # In enforcement mode, this returns 403. In shadow, it returns 200.
     response2 = client.post("/submit-candidate", json=payload2)
@@ -87,7 +87,8 @@ def test_shadow_mode_verification_violation_admitted_and_recorded():
     content_str = json.dumps(payload["state_content"], sort_keys=True)
     actual_hash = hashlib.sha256(content_str.encode()).hexdigest()
     payload["content_digest_sha256"] = actual_hash
-    payload["agent_signature"] = sk.sign(actual_hash.encode()).hex()
+    payload["agent_signature"] = _signer.sign(actual_hash.encode())
+    payload["signature_algorithm"] = "ECDSA-P256-SHA256"
     
     response = client.post("/submit-candidate", json=payload)
     assert response.status_code == 200
