@@ -12,3 +12,7 @@ build/
 *.wasm
 policies/*.tar.gz
 policies/*.wasm
+
+# Research papers / external documents
+*.pdf
+csr_pub_*
