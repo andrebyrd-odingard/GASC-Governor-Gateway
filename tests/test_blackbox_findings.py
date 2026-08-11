@@ -173,6 +173,39 @@ class TestC1CoversLaunderPoison:
         assert "c1b-child" in blast, \
             f"Child of covering compaction must be in blast radius: {blast}"
 
+    def test_context_compacted_covers_quarantined_refused(self):
+        """The /context-compacted endpoint must also refuse compaction
+        of quarantined nodes (same C1 gate as /submit-candidate)."""
+        _reset()
+        p = _make_payload("c1cc-node-p", {"data": "poison"}, ["clean-parent-1"])
+        assert client.post("/submit-candidate", json=p).status_code == 200
+        assert _designate("c1cc-node-p").status_code == 200
+
+        # Build a /context-compacted event covering the quarantined node
+        content = {"summary": "compacted poison"}
+        content_str = json.dumps(content, sort_keys=True)
+        actual_hash = hashlib.sha256(content_str.encode()).hexdigest()
+        sig = _signer.sign(actual_hash.encode())
+
+        event = {
+            "compacted_node_ids": ["c1cc-node-p"],
+            "compaction_node_id": "c1cc-compact",
+            "timestamp_utc": "2026-10-27T10:30:00Z",
+            "ephemeral_nhi": {
+                "identity_id": PUBLIC_KEY_HEX,
+                "session_token": _agent_token(),
+                "expires_at_utc": "2026-10-27T11:00:00Z",
+            },
+            "state_content": content,
+            "agent_signature": sig,
+            "signature_algorithm": "ECDSA-P256-SHA256",
+            "method_id": "llm_summary",
+        }
+        resp = client.post("/context-compacted", json=event)
+        assert resp.status_code == 403, \
+            f"/context-compacted covering quarantined node should be 403: {resp.status_code} {resp.json()}"
+        assert resp.json()["detail"]["error"] == "TAINTED_COVERS"
+
     def test_control_material_child_still_quarantined(self):
         """A normal MATERIAL child of a poisoned node IS quarantined
         (control case -- ensures the fix didn't break normal traversal)."""

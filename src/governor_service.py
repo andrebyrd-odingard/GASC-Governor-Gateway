@@ -1527,6 +1527,21 @@ async def declare_context_compacted(event: ContextCompactedEvent, request: Reque
     if not verify_cryptographic_signature(payload):
         raise HTTPException(status_code=401, detail="Cryptographic signature verification failed")
 
+    # C1 fix: check covers (= compacted_node_ids) for quarantine before commit.
+    # /context-compacted bypasses evaluate_admission, so the covers check
+    # must be applied directly here.
+    covers_quarantined = await backend.are_quarantined(event.compacted_node_ids)
+    tainted_covers = [cid for cid in event.compacted_node_ids if covers_quarantined.get(cid)]
+    if tainted_covers:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "TAINTED_COVERS",
+                "message": "Compaction covers quarantined nodes",
+                "tainted_covers": tainted_covers,
+            }
+        )
+
     # Shared lock: /context-compacted is a commit path, same as /submit-candidate.
     async with _admission_shared():
         await backend.commit_node(payload)
