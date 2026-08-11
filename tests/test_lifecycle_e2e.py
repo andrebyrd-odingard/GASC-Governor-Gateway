@@ -336,6 +336,11 @@ def test_full_lifecycle():
     assert tainted_stats["completion_rate"] == 0.0
 
     # ===== Step 5b: Agent retries by re-parenting onto the replacement =====
+    # Look up the replacement node's content hash so parent_content_hash matches
+    dag_5b = client.get("/db-state", headers=_auth_headers("admin")).json()["dag"]
+    _content_hash_registry[replacement_node_id] = dag_5b[replacement_node_id].get(
+        "content_digest_sha256", "e" * 64)
+
     # The agent re-submits its write building on the clean replacement node.
     retry_write = _make_payload("retry-attempt", {"data": "wants clean lineage"},
                                 [replacement_node_id])
@@ -587,3 +592,151 @@ def test_unknown_detector_source_rejected():
     )
     assert resp.status_code == 400
     assert "Unknown detector source" in resp.json()["detail"]
+
+
+# ---- Completion metric anti-gaming tests ----
+# These defend the structural-match gate in check_retry_completion.
+
+def _setup_tainted_scenario(prefix):
+    """Build a minimal graph, poison a node, get a 403 with replacement.
+
+    Graph: clean-parent-1 -> {prefix}-root (criticality=0.9)
+    Checkpoint: cp-{prefix} on {prefix}-root
+    Poison: {prefix}-root
+    Tainted write: {prefix}-rejected -> 403
+
+    Returns (replacement_node_id, rejected_payload_id).
+    """
+    client.post("/reset-db", headers=_auth_headers("admin"))
+    settings.ENFORCEMENT_MODE = "enforce"
+    settings.CONTINUITY_ENABLED = True
+
+    root_content = {"root": prefix}
+    root = _make_payload(f"{prefix}-root", root_content, ["clean-parent-1"],
+                         criticality_weight=0.9)
+    assert client.post("/submit-candidate", json=root).status_code == 200
+
+    # Checkpoint the root pre-incident
+    resp = client.post("/checkpoint", json={
+        "checkpoint_id": f"cp-{prefix}",
+        "target_node_id": f"{prefix}-root",
+        "declared_at_utc": "2020-01-01T00:00:00Z",
+        "snapshot_data": root_content,
+    }, headers=_auth_headers("admin"))
+    assert resp.status_code == 200
+
+    # Poison the root
+    resp = client.post("/designate", json={
+        "poisoned_node_id": f"{prefix}-root",
+        "detected_at_utc": "2026-10-27T10:15:00Z",
+        "source": "amg_tamper_check",
+        "confidence_score": 0.99,
+        "reason": "test taint",
+    }, headers=_auth_headers("designator"))
+    assert resp.status_code == 200
+
+    # Submit a tainted write -> 403 with replacement
+    rejected_id = f"{prefix}-rejected"
+    tainted_write = _make_payload(rejected_id, {"data": "blocked"}, [f"{prefix}-root"])
+    resp = client.post("/submit-candidate", json=tainted_write)
+    assert resp.status_code == 403
+    event_body = resp.json()["detail"]["event"]
+    assert event_body.get("continuity_available") is True, \
+        f"403 should indicate continuity_available=True: {event_body}"
+    replacement_node_id = event_body["replacement_node_id"]
+
+    return replacement_node_id, rejected_id
+
+
+def test_forged_retry_of_no_structural_parent():
+    """A write that declares retry_of but parents on an unrelated clean node
+    must NOT increment completed. This is the forgery case."""
+    replacement_id, rejected_id = _setup_tainted_scenario("forge")
+
+    # Submit a write with retry_of pointing to the rejection, but parenting
+    # on clean-parent-1 (not the replacement).
+    forged = _make_payload("forge-fake-retry", {"data": "unrelated"}, ["clean-parent-1"])
+    forged["retry_of"] = rejected_id
+    resp = client.post("/submit-candidate", json=forged)
+    assert resp.status_code == 200, f"Write should be admitted: {resp.json()}"
+
+    stats = client.get("/continuity-report", headers=_auth_headers("admin")).json()
+    tainted = stats["operational_footprint"]["authorized_tainted_action_completion"]
+    assert tainted["completed"] == 0, \
+        f"Forged retry_of without structural parent must not complete: {tainted}"
+
+
+def test_wrong_identity_no_completion():
+    """Correct structural parent + retry_of, but different identity_id.
+    Must NOT get completion credit."""
+    replacement_id, rejected_id = _setup_tainted_scenario("idchk")
+
+    # Look up the replacement node's content hash from the DAG
+    dag = client.get("/db-state", headers=_auth_headers("admin")).json()["dag"]
+    replacement_hash = dag[replacement_id].get("content_digest_sha256", "e" * 64)
+    _content_hash_registry[replacement_id] = replacement_hash
+
+    # Create a second signer with a different identity
+    other_signer = ECDSASigner()
+    other_pub = other_signer.public_key_hex
+
+    content = {"data": "stolen credit"}
+    content_str = json.dumps(content, sort_keys=True)
+    actual_hash = hashlib.sha256(content_str.encode()).hexdigest()
+    sig = other_signer.sign(actual_hash.encode())
+
+    _content_hash_registry["idchk-impostor"] = actual_hash
+
+    impostor_write = {
+        "payload_id": "idchk-impostor",
+        "timestamp_utc": "2026-10-27T10:00:00Z",
+        "ephemeral_nhi": {
+            "identity_id": other_pub,
+            "session_token": _agent_token(other_pub),
+            "expires_at_utc": "2026-10-27T11:00:00Z",
+        },
+        "declared_evidence_boundary": {
+            "boundary_id": "b1",
+            "fixed_at_utc": "2026-10-26T00:00:00Z",
+            "boundary_digest": "f" * 64,
+        },
+        "parent_dependency_commitments": [{
+            "parent_node_id": replacement_id,
+            "parent_content_hash": replacement_hash,
+        }],
+        "state_content": content,
+        "content_digest_sha256": actual_hash,
+        "agent_signature": sig,
+        "signature_algorithm": "ECDSA-P256-SHA256",
+        "retry_of": rejected_id,
+    }
+    resp = client.post("/submit-candidate", json=impostor_write)
+    assert resp.status_code == 200, f"Write should be admitted: {resp.json()}"
+
+    stats = client.get("/continuity-report", headers=_auth_headers("admin")).json()
+    tainted = stats["operational_footprint"]["authorized_tainted_action_completion"]
+    assert tainted["completed"] == 0, \
+        f"Wrong identity with retry_of must not complete: {tainted}"
+
+
+def test_structural_only_no_retry_of():
+    """Parents on the replacement without retry_of. Completion must still
+    increment — proves retry_of is not load-bearing."""
+    replacement_id, rejected_id = _setup_tainted_scenario("struct")
+
+    # Look up the replacement node's content hash from the DAG
+    dag = client.get("/db-state", headers=_auth_headers("admin")).json()["dag"]
+    replacement_hash = dag[replacement_id].get("content_digest_sha256", "e" * 64)
+    _content_hash_registry[replacement_id] = replacement_hash
+
+    # Submit a write parenting on the replacement, with no retry_of field.
+    structural = _make_payload("struct-real-retry", {"data": "re-derived"}, [replacement_id])
+    assert "retry_of" not in structural
+    resp = client.post("/submit-candidate", json=structural)
+    assert resp.status_code == 200, f"Write should be admitted: {resp.json()}"
+
+    stats = client.get("/continuity-report", headers=_auth_headers("admin")).json()
+    tainted = stats["operational_footprint"]["authorized_tainted_action_completion"]
+    assert tainted["completed"] >= 1, \
+        f"Structural match without retry_of must complete: {tainted}"
+    assert tainted["completion_rate"] > 0.0
