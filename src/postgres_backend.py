@@ -312,6 +312,14 @@ class PostgresStateBackend(BaseStateBackend):
                         "VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
                         node_id, p["parent_node_id"], p.get("edge_class", "MATERIAL")
                     )
+                # C1 fix: materialize covers[] as COVERS edges so the
+                # recursive CTE traverses them during blast-radius.
+                for covered_id in payload.get("covers", []):
+                    await conn.execute(
+                        "INSERT INTO edges (child_id, parent_id, edge_class) "
+                        "VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                        node_id, covered_id, "COVERS"
+                    )
                 return True
 
     async def nodes_exist(self, node_ids: List[str]) -> Dict[str, bool]:

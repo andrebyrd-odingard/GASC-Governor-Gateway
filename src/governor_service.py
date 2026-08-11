@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, HTTPException, Request
 import json
 import subprocess
 import asyncio
@@ -271,6 +271,11 @@ class MemoryStateBackend(BaseStateBackend):
                         queue.append(node_id)
                         if is_carried:
                             affected_compactions.append(node_id)
+                    # C1 fix: also follow covers[] edges. A compaction that
+                    # covers a tainted node carries tainted material.
+                    elif current in node_data.get("covers", []):
+                        visited.add(node_id)
+                        queue.append(node_id)
             
             # R1 & R2
             semantic_rollback = False
@@ -1289,6 +1294,17 @@ async def submit_candidate(request: Request):
     tainted_event = None
 
     async with _admission_shared():
+        # C4 fix: reject writes whose payload_id is already quarantined.
+        # The old behavior was a silent no-op (INSERT OR IGNORE) returning
+        # 200, which is misleading — the caller thinks new content landed.
+        payload_id = payload.get("payload_id", "")
+        id_quarantined = await backend.are_quarantined([payload_id])
+        if id_quarantined.get(payload_id):
+            raise HTTPException(
+                status_code=409,
+                detail=f"payload_id {payload_id} is quarantined; cannot reuse a quarantined identity"
+            )
+
         exists_map, quarantined_map, content_hash_map = await asyncio.gather(
             backend.nodes_exist(parent_ids),
             backend.are_quarantined(parent_ids),
@@ -1297,6 +1313,22 @@ async def submit_candidate(request: Request):
 
         if payload.get("node_type") == "COMPACTION":
             payload["covers_interval_gap"] = await backend.compute_covers_interval_gap(payload.get("covers", []))
+            # C1 fix: reject compaction nodes that cover quarantined nodes.
+            # A compaction summarizes its covers[]; if any covered node is
+            # quarantined, the summary carries tainted material.
+            covers = payload.get("covers", [])
+            if covers:
+                covers_quarantined = await backend.are_quarantined(covers)
+                tainted_covers = [cid for cid in covers if covers_quarantined.get(cid)]
+                if tainted_covers:
+                    raise HTTPException(
+                        status_code=403,
+                        detail={
+                            "error": "TAINTED_COVERS",
+                            "message": "Compaction covers quarantined nodes",
+                            "tainted_covers": tainted_covers,
+                        }
+                    )
 
         try:
             decision = await evaluate_admission(payload, parent_ids, exists_map, quarantined_map, auth_context)
@@ -2249,6 +2281,33 @@ async def reset_db(request: Request):
     await backend.reset()
     return {"status": "ok"}
 
+@app.post("/seed-root")
+async def seed_root(request: Request, body: dict = Body(...)):
+    """C3 mitigation: admin can seed a new independent root when the
+    existing root(s) are quarantined. This restores write availability
+    without clearing quarantine.
+
+    Body: {"root_id": "new-root-id"}
+    """
+    verify_role_jwt(request, "admin")
+    root_id = body.get("root_id")
+    if not root_id:
+        raise HTTPException(status_code=400, detail="root_id required")
+    exists = await backend.nodes_exist([root_id])
+    if exists.get(root_id):
+        raise HTTPException(status_code=409, detail=f"Node {root_id} already exists")
+    seed_payload = {
+        "payload_id": root_id,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "state_content": {"type": "seed_root", "seeded_by": "admin"},
+        "parent_dependency_commitments": [],
+        "content_digest_sha256": hashlib.sha256(
+            json.dumps({"type": "seed_root", "seeded_by": "admin"}, sort_keys=True).encode()
+        ).hexdigest(),
+    }
+    await backend.commit_node(seed_payload)
+    return {"status": "ok", "root_id": root_id}
+
 @app.get("/reducibility-report")
 async def get_reducibility_report(request: Request):
     verify_role_jwt(request, "admin")
@@ -2359,12 +2418,29 @@ async def get_measured_cost(request: Request):
     quarantined_count = len(quarantine_ledger)
     withdrawn_count = len(withdrawal_ledger)
 
-    # Safety: containment integrity
+    # Safety: containment integrity — count nodes outside quarantine
+    # that derive from quarantined material (via parents or covers).
+    q_set = set(quarantine_ledger)
+    breaches = []
+    for nid, ndata in dag.items():
+        if nid in q_set:
+            continue
+        for p in ndata.get("parent_dependency_commitments", []):
+            if p["parent_node_id"] in q_set:
+                breaches.append(nid)
+                break
+        else:
+            for covered in ndata.get("covers", []):
+                if covered in q_set:
+                    breaches.append(nid)
+                    break
+
     safety_metrics = {
         "quarantined_nodes": quarantined_count,
         "containment_fraction": quarantined_count / total_nodes if total_nodes > 0 else 0.0,
         "withdrawn_nodes": withdrawn_count,
-        "containment_breaches": 0,
+        "containment_breaches": len(breaches),
+        "escape_set": breaches,
     }
 
     # Availability: fraction of DAG usable (not quarantined, not withdrawn)

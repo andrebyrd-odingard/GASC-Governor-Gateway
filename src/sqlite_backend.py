@@ -231,6 +231,13 @@ class SqliteStateBackend(BaseStateBackend):
                     "INSERT OR IGNORE INTO edges (child_id, parent_id, edge_class) VALUES (?, ?, ?)",
                     (node_id, p["parent_node_id"], p.get("edge_class", "MATERIAL"))
                 )
+            # C1 fix: materialize covers[] as COVERS edges so the BFS
+            # can traverse them during blast-radius computation.
+            for covered_id in payload.get("covers", []):
+                await db.execute(
+                    "INSERT OR IGNORE INTO edges (child_id, parent_id, edge_class) VALUES (?, ?, ?)",
+                    (node_id, covered_id, "COVERS")
+                )
             await db.commit()
             return True
 
