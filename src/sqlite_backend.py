@@ -4,6 +4,9 @@ import hashlib
 import os
 from typing import Dict, Any, List
 from contextlib import asynccontextmanager
+import contextvars
+
+_tx_conn = contextvars.ContextVar("_tx_conn", default=None)
 
 from src.governor_service import BaseStateBackend
 from src.config import settings
@@ -15,12 +18,43 @@ class SqliteStateBackend(BaseStateBackend):
         self._max_traversal_depth = getattr(settings, "MAX_TRAVERSAL_DEPTH", 1000)
 
     @asynccontextmanager
+    async def transaction(self):
+        conn = _tx_conn.get()
+        if conn is not None:
+            yield
+            return
+            
+        async with aiosqlite.connect(self.db_path, timeout=5.0) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA synchronous=FULL")
+            await db.execute("BEGIN IMMEDIATE")
+            original_commit = db.commit
+            async def noop_commit(): pass
+            db.commit = noop_commit
+            token = _tx_conn.set(db)
+            try:
+                yield
+                db.commit = original_commit
+                await db.commit()
+            except Exception:
+                db.commit = original_commit
+                await db.rollback()
+                raise
+            finally:
+                db.commit = original_commit
+                _tx_conn.reset(token)
+
+    @asynccontextmanager
     async def _connect(self):
-        if self._db is None:
-            self._db = await aiosqlite.connect(self.db_path)
-            await self._db.execute("PRAGMA journal_mode=WAL")
-            await self._db.execute("PRAGMA synchronous=FULL")
-        yield self._db
+        conn = _tx_conn.get()
+        if conn is not None:
+            yield conn
+        else:
+            if self._db is None:
+                self._db = await aiosqlite.connect(self.db_path, timeout=5.0)
+                await self._db.execute("PRAGMA journal_mode=WAL")
+                await self._db.execute("PRAGMA synchronous=FULL")
+            yield self._db
 
     async def init_db(self):
         async with self._connect() as db:

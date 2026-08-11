@@ -1,3 +1,5 @@
+from fastapi.responses import JSONResponse
+
 from fastapi import Body, FastAPI, HTTPException, Request
 import json
 import subprocess
@@ -100,6 +102,10 @@ class ExternalEffectEvent(BaseModel):
 
 # --- State Backend Abstraction ---
 class BaseStateBackend(ABC):
+    @abstractmethod
+    @asynccontextmanager
+    async def transaction(self):
+        yield
     @abstractmethod
     async def get_dag(self) -> Dict[str, Any]: pass
     @abstractmethod
@@ -1241,11 +1247,17 @@ async def evaluate_admission(payload: dict, parent_ids: List[str], exists_map: D
 
     return {"admit": True}
 
+MAX_PAYLOAD_BYTES = int(os.environ.get("MAX_PAYLOAD_BYTES", 2 * 1024 * 1024))
+
 @app.post("/submit-candidate")
 async def submit_candidate(request: Request):
 
+    body_bytes = await request.body()
+    if len(body_bytes) > MAX_PAYLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"Payload exceeds maximum allowed size of {MAX_PAYLOAD_BYTES} bytes")
+
     try:
-        payload = await request.json()
+        payload = json.loads(body_bytes)
     except:
         raise HTTPException(status_code=400, detail="Invalid JSON format")
         
@@ -1294,176 +1306,187 @@ async def submit_candidate(request: Request):
     tainted_event = None
 
     async with _admission_shared():
-        # C4 fix: reject writes whose payload_id is already quarantined.
-        # The old behavior was a silent no-op (INSERT OR IGNORE) returning
-        # 200, which is misleading — the caller thinks new content landed.
-        payload_id = payload.get("payload_id", "")
-        id_quarantined = await backend.are_quarantined([payload_id])
-        if id_quarantined.get(payload_id):
-            raise HTTPException(
-                status_code=409,
-                detail=f"payload_id {payload_id} is quarantined; cannot reuse a quarantined identity"
+        async with backend.transaction():
+                # C4 fix: reject writes whose payload_id is already quarantined.
+            # The old behavior was a silent no-op (INSERT OR IGNORE) returning
+            # 200, which is misleading — the caller thinks new content landed.
+            payload_id = payload.get("payload_id", "")
+            id_quarantined = await backend.are_quarantined([payload_id])
+            if id_quarantined.get(payload_id):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"payload_id {payload_id} is quarantined; cannot reuse a quarantined identity"
+                )
+
+            exists_map, quarantined_map, content_hash_map = await asyncio.gather(
+                backend.nodes_exist(parent_ids),
+                backend.are_quarantined(parent_ids),
+                backend.get_node_content_hashes(parent_ids),
             )
 
-        exists_map, quarantined_map, content_hash_map = await asyncio.gather(
-            backend.nodes_exist(parent_ids),
-            backend.are_quarantined(parent_ids),
-            backend.get_node_content_hashes(parent_ids),
-        )
-
-        if payload.get("node_type") == "COMPACTION":
-            payload["covers_interval_gap"] = await backend.compute_covers_interval_gap(payload.get("covers", []))
-            # C1 fix: reject compaction nodes that cover quarantined nodes.
-            # A compaction summarizes its covers[]; if any covered node is
-            # quarantined, the summary carries tainted material.
-            covers = payload.get("covers", [])
-            if covers:
-                covers_quarantined = await backend.are_quarantined(covers)
-                tainted_covers = [cid for cid in covers if covers_quarantined.get(cid)]
-                if tainted_covers:
-                    raise HTTPException(
-                        status_code=403,
-                        detail={
-                            "error": "TAINTED_COVERS",
-                            "message": "Compaction covers quarantined nodes",
-                            "tainted_covers": tainted_covers,
-                        }
-                    )
-
-        try:
-            decision = await evaluate_admission(payload, parent_ids, exists_map, quarantined_map, auth_context)
-        except PolicyEvaluationError as e:
-            # FAIL-CLOSED: If the policy engine cannot be reached or fails to
-            # produce a decision, the write is NEVER admitted. A policy failure
-            # is an availability condition, not an authorization one, so 503.
-            raise HTTPException(status_code=503, detail=f"Policy engine unavailable: {e}")
-
-        parent_status_json = json.dumps([{"parent_node_id": pid, "exists": exists_map.get(pid, False), "quarantined": quarantined_map.get(pid, False)} for pid in parent_ids])
-
-        if settings.ENFORCEMENT_MODE == "shadow":
-            # Idempotency: if commit returns False, this is a duplicate — skip audit
-            is_new = await backend.commit_node(payload)
-        else:
-            if not decision["admit"]:
-                if decision.get("reason") == "TAINTED_PARENT":
-                    poisoned_root = decision["poisoned_root"]
-                    # Deliberate: commit the rejected payload so it appears in the
-                    # blast-radius BFS and the quarantine ledger for audit
-                    # completeness.  The node is refused (403) but its attempt is
-                    # permanently recorded — the same way a firewall logs dropped
-                    # packets.
-                    await backend.commit_node(payload)
-                    c_p = await backend.compute_blast_radius(poisoned_root)
-
-                    from src.r6_utils import process_recurrence
-                    active_horizons = await backend.get_active_horizon_set()
-                    for n in c_p:
-                        if n in active_horizons:
-                            await process_recurrence(backend, n, "PROHIBITED_PATH", "internal_hook")
-
-                    new_quarantined = [payload.get("payload_id")]
-                    monotonic_ledger_digest = await backend.compute_quarantine_digest(c_p + new_quarantined)
-
-                    tainted_event = {
-                        "quarantine_event_id": str(uuid.uuid4()),
-                        "detected_at_utc": datetime.now(timezone.utc).isoformat() + "Z",
-                        "poisoned_root_id": poisoned_root,
-                        "computed_blast_radius_C_p": c_p,
-                        "monotonic_ledger_digest_post_transition": monotonic_ledger_digest
-                    }
-                    await backend.apply_quarantine_transaction(tainted_event, new_quarantined)
-
-                    # B.8: Track tainted-action rejection for completion metric
-                    await backend.record_tainted_rejection(
-                        payload.get("payload_id", "unknown"),
-                        poisoned_root,
-                        datetime.now(timezone.utc).isoformat() + "Z",
-                        author_identity=payload.get("ephemeral_nhi", {}).get("identity_id", "")
-                    )
-
-                    # Check if continuity already produced a replacement
-                    replacement = await backend.find_continuity_replacement(poisoned_root)
-                    if replacement:
-                        tainted_event["continuity_available"] = True
-                        tainted_event["replacement_node_id"] = replacement["replacement_node_id"]
-                        tainted_event["replacement_for"] = replacement["replacement_for"]
-                        tainted_event["replacement_mechanism"] = replacement["mechanism"]
-                        # Classify: direct = the immediate tainted parent was replaced;
-                        # ancestor = an upstream node was replaced, re-derivation needed.
-                        replacement_type = "direct" if replacement["replacement_for"] == poisoned_root else "ancestor"
-                        # Record offer — NOT completion. Completion requires
-                        # the agent to actually re-parent and land a write.
-                        await backend.record_tainted_offer(
-                            payload.get("payload_id", "unknown"),
-                            replacement["replacement_node_id"],
-                            replacement_type
+            if payload.get("node_type") == "COMPACTION":
+                payload["covers_interval_gap"] = await backend.compute_covers_interval_gap(payload.get("covers", []))
+                # C1 fix: reject compaction nodes that cover quarantined nodes.
+                # A compaction summarizes its covers[]; if any covered node is
+                # quarantined, the summary carries tainted material.
+                covers = payload.get("covers", [])
+                if covers:
+                    covers_quarantined = await backend.are_quarantined(covers)
+                    tainted_covers = [cid for cid in covers if covers_quarantined.get(cid)]
+                    if tainted_covers:
+                        raise HTTPException(
+                            status_code=403,
+                            detail={
+                                "error": "TAINTED_COVERS",
+                                "message": "Compaction covers quarantined nodes",
+                                "tainted_covers": tainted_covers,
+                            }
                         )
-                    else:
-                        tainted_event["continuity_available"] = False
-                # other non-admit cases do not commit; audit is handled outside
-            else:
-                # REQ-001: Verify declared parent_content_hash matches stored content_digest_sha256
-                if parent_ids:
-                    for p in payload.get("parent_dependency_commitments", []):
-                        pid = p["parent_node_id"]
-                        declared_hash = p.get("parent_content_hash", "")
-                        stored_hash = content_hash_map.get(pid, "")
-                        if stored_hash and declared_hash != stored_hash:
-                            raise HTTPException(
-                                status_code=403,
-                                detail=f"Content hash mismatch for parent {pid}: declared {declared_hash[:16]}... != stored {stored_hash[:16]}..."
-                            )
+
+            try:
+                decision = await evaluate_admission(payload, parent_ids, exists_map, quarantined_map, auth_context)
+            except PolicyEvaluationError as e:
+                # FAIL-CLOSED: If the policy engine cannot be reached or fails to
+                # produce a decision, the write is NEVER admitted. A policy failure
+                # is an availability condition, not an authorization one, so 503.
+                raise HTTPException(status_code=503, detail=f"Policy engine unavailable: {e}")
+
+            parent_status_json = json.dumps([{"parent_node_id": pid, "exists": exists_map.get(pid, False), "quarantined": quarantined_map.get(pid, False)} for pid in parent_ids])
+
+            if settings.ENFORCEMENT_MODE == "shadow":
                 # Idempotency: if commit returns False, this is a duplicate — skip audit
                 is_new = await backend.commit_node(payload)
-
-    # Shadow / audit writes happen outside the admission lock.  They must still
-    # complete before the response is returned, but they do not extend the
-    # critical section.
-    if settings.ENFORCEMENT_MODE == "shadow":
-        if is_new:
-            await backend.record_shadow_decision(
-                decision_id=decision_id,
-                node_id=payload.get("payload_id"),
-                evaluated_at_utc=datetime.now(timezone.utc).isoformat() + "Z",
-                would_have_blocked=not decision["admit"],
-                reason=decision.get("reason", ""),
-                parent_status_json=parent_status_json,
-                policy_bundle_digest=settings.OPA_POLICY_BUNDLE or "none",
-                writer_identity=writer_identity
-            )
-        return {"status": "success", "message": "State node committed to DAG (Shadow Mode)."}
-    else:
-        if not decision["admit"]:
-            await backend.record_shadow_decision(
-                decision_id=decision_id,
-                node_id=payload.get("payload_id"),
-                evaluated_at_utc=datetime.now(timezone.utc).isoformat() + "Z",
-                would_have_blocked=True,
-                reason=decision.get("reason", ""),
-                parent_status_json=parent_status_json,
-                policy_bundle_digest=settings.OPA_POLICY_BUNDLE or "none",
-                writer_identity=writer_identity
-            )
-
-            if tainted_event:
-                raise HTTPException(status_code=403, detail={"error": "TAINTED_PARENT", "event": tainted_event})
             else:
-                raise HTTPException(status_code=403 if decision.get("reason") == "Verification Separation Policy Failed" else 400, detail=decision.get("reason", "Policy Failed"))
+                if not decision["admit"]:
+                    if decision.get("reason") == "TAINTED_PARENT":
+                        poisoned_root = decision["poisoned_root"]
+                        # Deliberate: commit the rejected payload so it appears in the
+                        # blast-radius BFS and the quarantine ledger for audit
+                        # completeness.  The node is refused (403) but its attempt is
+                        # permanently recorded — the same way a firewall logs dropped
+                        # packets.
+                        await backend.commit_node(payload)
+                        c_p = await backend.compute_blast_radius(poisoned_root)
 
-        if is_new:
-            await backend.record_shadow_decision(
-                decision_id=decision_id,
-                node_id=payload.get("payload_id"),
-                evaluated_at_utc=datetime.now(timezone.utc).isoformat() + "Z",
-                would_have_blocked=False,
-                reason="",
-                parent_status_json=parent_status_json,
-                policy_bundle_digest=settings.OPA_POLICY_BUNDLE or "none",
-                writer_identity=writer_identity
-            )
-            # Check if this admitted write completes a previously rejected action
-            await backend.check_retry_completion(payload)
-        return {"status": "success", "message": "State node committed to DAG."}
+                        from src.r6_utils import process_recurrence
+                        active_horizons = await backend.get_active_horizon_set()
+                        for n in c_p:
+                            if n in active_horizons:
+                                await process_recurrence(backend, n, "PROHIBITED_PATH", "internal_hook")
+
+                        new_quarantined = [payload.get("payload_id")]
+                        monotonic_ledger_digest = await backend.compute_quarantine_digest(c_p + new_quarantined)
+
+                        tainted_event = {
+                            "quarantine_event_id": str(uuid.uuid4()),
+                            "detected_at_utc": datetime.now(timezone.utc).isoformat() + "Z",
+                            "poisoned_root_id": poisoned_root,
+                            "computed_blast_radius_C_p": c_p,
+                            "monotonic_ledger_digest_post_transition": monotonic_ledger_digest
+                        }
+                        await backend.apply_quarantine_transaction(tainted_event, new_quarantined)
+
+                        # B.8: Track tainted-action rejection for completion metric
+                        await backend.record_tainted_rejection(
+                            payload.get("payload_id", "unknown"),
+                            poisoned_root,
+                            datetime.now(timezone.utc).isoformat() + "Z",
+                            author_identity=payload.get("ephemeral_nhi", {}).get("identity_id", "")
+                        )
+
+                        # Check if continuity already produced a replacement
+                        replacement = await backend.find_continuity_replacement(poisoned_root)
+                        if replacement:
+                            tainted_event["continuity_available"] = True
+                            tainted_event["replacement_node_id"] = replacement["replacement_node_id"]
+                            tainted_event["replacement_for"] = replacement["replacement_for"]
+                            tainted_event["replacement_mechanism"] = replacement["mechanism"]
+                            # Classify: direct = the immediate tainted parent was replaced;
+                            # ancestor = an upstream node was replaced, re-derivation needed.
+                            replacement_type = "direct" if replacement["replacement_for"] == poisoned_root else "ancestor"
+                            # Record offer — NOT completion. Completion requires
+                            # the agent to actually re-parent and land a write.
+                            await backend.record_tainted_offer(
+                                payload.get("payload_id", "unknown"),
+                                replacement["replacement_node_id"],
+                                replacement_type
+                            )
+                        else:
+                            tainted_event["continuity_available"] = False
+                    # other non-admit cases do not commit; audit is handled outside
+                else:
+                    # REQ-001: Verify declared parent_content_hash matches stored content_digest_sha256
+                    if parent_ids:
+                        for p in payload.get("parent_dependency_commitments", []):
+                            pid = p["parent_node_id"]
+                            declared_hash = p.get("parent_content_hash", "")
+                            stored_hash = content_hash_map.get(pid, "")
+                            if stored_hash and declared_hash != stored_hash:
+                                raise HTTPException(
+                                    status_code=403,
+                                    detail=f"Content hash mismatch for parent {pid}: declared {declared_hash[:16]}... != stored {stored_hash[:16]}..."
+                                )
+                    # Idempotency: if commit returns False, this is a duplicate — skip audit
+                    is_new = await backend.commit_node(payload)
+
+                # Shadow / audit writes happen inside the transaction now.
+                if settings.ENFORCEMENT_MODE == "shadow":
+                    if is_new:
+                        await backend.record_shadow_decision(
+                            decision_id=decision_id,
+                            node_id=payload.get("payload_id"),
+                            evaluated_at_utc=datetime.now(timezone.utc).isoformat() + "Z",
+                            would_have_blocked=not decision["admit"],
+                            reason=decision.get("reason", ""),
+                            parent_status_json=parent_status_json,
+                            policy_bundle_digest=settings.OPA_POLICY_BUNDLE or "none",
+                            writer_identity=writer_identity
+                        )
+                    return JSONResponse(status_code=200, content={"status": "success", "message": "State node committed to DAG (Shadow Mode).", "idempotent": not is_new})
+                else:
+                    if not decision["admit"]:
+                        await backend.record_shadow_decision(
+                            decision_id=decision_id,
+                            node_id=payload.get("payload_id"),
+                            evaluated_at_utc=datetime.now(timezone.utc).isoformat() + "Z",
+                            would_have_blocked=True,
+                            reason=decision.get("reason", ""),
+                            parent_status_json=parent_status_json,
+                            policy_bundle_digest=settings.OPA_POLICY_BUNDLE or "none",
+                            writer_identity=writer_identity
+                        )
+                        if tainted_event:
+                            return JSONResponse(
+                                status_code=403,
+                                content={
+                                    "detail": {
+                                        "error": "TAINTED_PARENT",
+                                        "event": tainted_event
+                                    }
+                                }
+                            )
+                        else:
+                            is_verification_sep = decision.get("reason") == "Verification Separation Policy Failed"
+                            return JSONResponse(
+                                status_code=403 if is_verification_sep else 400,
+                                content={
+                                    "detail": decision.get("reason", "Policy Failed")
+                                }
+                            )
+                    else:
+                        if is_new:
+                            await backend.record_shadow_decision(
+                                decision_id=decision_id,
+                                node_id=payload.get("payload_id"),
+                                evaluated_at_utc=datetime.now(timezone.utc).isoformat() + "Z",
+                                would_have_blocked=False,
+                                reason="admit",
+                                parent_status_json=parent_status_json,
+                                policy_bundle_digest=settings.OPA_POLICY_BUNDLE or "none",
+                                writer_identity=writer_identity
+                            )
+                            await backend.check_retry_completion(payload)
+                        return JSONResponse(status_code=200, content={"status": "success", "message": "State node committed to DAG.", "idempotent": not is_new})
 
 @app.post("/declare-external-effect")
 
@@ -1885,44 +1908,45 @@ async def designate_poison(event: DesignationEvent, request: Request):
     # admissions until the quarantine ledger is updated, closing the phantom race.
     # Designations are rare; contention is negligible by construction.
     async with _admission_exclusive():
-        exists_map, quarantined_map = await asyncio.gather(
-            backend.nodes_exist([event.poisoned_node_id]),
-            backend.are_quarantined([event.poisoned_node_id]),
-        )
-        if not exists_map.get(event.poisoned_node_id):
-            raise HTTPException(status_code=404, detail="Node ID not found in DAG")
-        if quarantined_map.get(event.poisoned_node_id):
-            return {"status": "ok", "message": "Node already in quarantine ledger"}
+        async with backend.transaction():
+            exists_map, quarantined_map = await asyncio.gather(
+                backend.nodes_exist([event.poisoned_node_id]),
+                backend.are_quarantined([event.poisoned_node_id]),
+            )
+            if not exists_map.get(event.poisoned_node_id):
+                return JSONResponse(status_code=404, content={"detail": "Node ID not found in DAG"})
+            if quarantined_map.get(event.poisoned_node_id):
+                return JSONResponse(status_code=200, content={"status": "ok", "message": "Node already in quarantine ledger"})
 
-        c_p = await backend.compute_blast_radius(event.poisoned_node_id)
+            c_p = await backend.compute_blast_radius(event.poisoned_node_id)
 
-        from src.r6_utils import process_recurrence
-        active_horizons = await backend.get_active_horizon_set()
-        for n in c_p:
-            if n in active_horizons:
-                await process_recurrence(backend, n, "RENEWED_DESIGNATION", "internal_hook")
+            from src.r6_utils import process_recurrence
+            active_horizons = await backend.get_active_horizon_set()
+            for n in c_p:
+                if n in active_horizons:
+                    await process_recurrence(backend, n, "RENEWED_DESIGNATION", "internal_hook")
 
-        monotonic_ledger_digest = await backend.compute_quarantine_digest(c_p)
+            monotonic_ledger_digest = await backend.compute_quarantine_digest(c_p)
 
-        q_event = {
-            "quarantine_event_id": str(uuid.uuid4()),
-            "detected_at_utc": datetime.now(timezone.utc).isoformat() + "Z",
-            "poisoned_root_id": event.poisoned_node_id,
-            "computed_blast_radius_C_p": c_p,
-            "monotonic_ledger_digest_post_transition": monotonic_ledger_digest,
-            "designator_identity": designator_identity,
-            "designation_reason": event.reason
-        }
-        await backend.apply_quarantine_transaction(q_event, c_p)
+            q_event = {
+                "quarantine_event_id": str(uuid.uuid4()),
+                "detected_at_utc": datetime.now(timezone.utc).isoformat() + "Z",
+                "poisoned_root_id": event.poisoned_node_id,
+                "computed_blast_radius_C_p": c_p,
+                "monotonic_ledger_digest_post_transition": monotonic_ledger_digest,
+                "designator_identity": designator_identity,
+                "designation_reason": event.reason
+            }
+            await backend.apply_quarantine_transaction(q_event, c_p)
 
-    # --- M3/M4 Safe Continuity (§7.2 row 4) ---
-    # After containment, attempt to restore critical function availability
-    # without clearing taint, reducing quarantine, or rehabilitating identity.
-    continuity_results = await _attempt_safe_continuity(c_p, q_event)
+            # --- M3/M4 Safe Continuity (§7.2 row 4) ---
+            # After containment, attempt to restore critical function availability
+            # without clearing taint, reducing quarantine, or rehabilitating identity.
+            continuity_results = await _attempt_safe_continuity(c_p, q_event)
 
-    await _attempt_reconstruction(event.poisoned_node_id)
-    
-    return {"status": "success", "event": q_event, "continuity": continuity_results}
+            await _attempt_reconstruction(event.poisoned_node_id)
+            
+            return JSONResponse(status_code=200, content={"status": "success", "event": q_event, "continuity": continuity_results})
 
 
 @app.post("/continuity-expose")
@@ -1937,22 +1961,22 @@ async def record_continuity_exposure(request: Request):
     node_id = body.get("node_id")
     substitute_status = body.get("substitute_status", "ORIGINAL")
     if not node_id:
-        raise HTTPException(status_code=400, detail="node_id required")
+            raise HTTPException(status_code=400, detail="node_id required")
     if substitute_status not in ("ORIGINAL", "BOUNDED_SUBSTITUTE", "DEGRADED", "CHECKPOINT"):
-        raise HTTPException(status_code=400, detail="substitute_status must be one of: ORIGINAL, BOUNDED_SUBSTITUTE, DEGRADED, CHECKPOINT")
+            raise HTTPException(status_code=400, detail="substitute_status must be one of: ORIGINAL, BOUNDED_SUBSTITUTE, DEGRADED, CHECKPOINT")
 
     # Safety check: no exposed item may be in Q
     q_ledger = await backend.get_quarantine_ledger()
     if node_id in q_ledger:
-        raise HTTPException(status_code=403, detail="Cannot expose quarantined node — taint fact must not be cleared")
+            raise HTTPException(status_code=403, detail="Cannot expose quarantined node — taint fact must not be cleared")
 
     quarantine_non_empty = len(q_ledger) > 0
     exposure_id = str(uuid.uuid4())
     exposure_record = {
-        "node_id": node_id,
-        "substitute_status": substitute_status,
-        "quarantine_set_size": len(q_ledger),
-        "reason": body.get("reason", ""),
+            "node_id": node_id,
+            "substitute_status": substitute_status,
+            "quarantine_set_size": len(q_ledger),
+            "reason": body.get("reason", ""),
     }
     await backend.record_continuity_exposure(exposure_id, node_id, substitute_status, quarantine_non_empty, exposure_record)
     return {"status": "success", "exposure_id": exposure_id, "quarantine_non_empty": quarantine_non_empty}
@@ -1985,31 +2009,31 @@ async def get_continuity_report(request: Request):
 
     # Containment footprint (safety proof — must not move)
     containment_footprint = {
-        "quarantine_ledger_size": len(q_ledger),
-        "quarantine_ledger_digest": hashlib.sha256(json.dumps(sorted(q_ledger), sort_keys=True).encode()).hexdigest(),
+            "quarantine_ledger_size": len(q_ledger),
+            "quarantine_ledger_digest": hashlib.sha256(json.dumps(sorted(q_ledger), sort_keys=True).encode()).hexdigest(),
     }
 
     # Operational-unavailability footprint (what continuity moves)
     operational_footprint = {
-        "critical_function_availability": len(available_critical) / len(critical_nodes) if critical_nodes else 1.0,
-        "total_critical_functions": len(critical_nodes),
-        "available_critical_functions": len(available_critical),
-        "trusted_substitution_coverage": len(substitutions),
-        "checkpoint_replay_count": len(checkpoint_replays),
-        "continuity_provenance_complete": all(
-            e.get("exposure_record", {}).get("mechanism") in ("M3", "M4") for e in exposures if e.get("quarantine_non_empty")
-        ),
-        "escalation_count": 0,
-        "authorized_tainted_action_completion": tainted_stats,
+            "critical_function_availability": len(available_critical) / len(critical_nodes) if critical_nodes else 1.0,
+            "total_critical_functions": len(critical_nodes),
+            "available_critical_functions": len(available_critical),
+            "trusted_substitution_coverage": len(substitutions),
+            "checkpoint_replay_count": len(checkpoint_replays),
+            "continuity_provenance_complete": all(
+                e.get("exposure_record", {}).get("mechanism") in ("M3", "M4") for e in exposures if e.get("quarantine_non_empty")
+            ),
+            "escalation_count": 0,
+            "authorized_tainted_action_completion": tainted_stats,
     }
 
     return {
-        "total_exposures": len(exposures),
-        "exercised_while_quarantine_non_empty": sum(1 for e in exposures if e.get("quarantine_non_empty")),
-        "non_vacuity_met": exercised,
-        "containment_footprint": containment_footprint,
-        "operational_footprint": operational_footprint,
-        "exposures": exposures,
+            "total_exposures": len(exposures),
+            "exercised_while_quarantine_non_empty": sum(1 for e in exposures if e.get("quarantine_non_empty")),
+            "non_vacuity_met": exercised,
+            "containment_footprint": containment_footprint,
+            "operational_footprint": operational_footprint,
+            "exposures": exposures,
     }
 
 
@@ -2029,22 +2053,22 @@ async def declare_substitute(request: Request):
     declared_at_utc = body.get("declared_at_utc")
 
     if not all([target_node_id, substitute_source_id, declared_at_utc]):
-        raise HTTPException(status_code=400, detail="target_node_id, substitute_source_id, and declared_at_utc are required")
+            raise HTTPException(status_code=400, detail="target_node_id, substitute_source_id, and declared_at_utc are required")
 
     # Verify the substitute source exists and is not quarantined
     exists_map = await backend.nodes_exist([substitute_source_id])
     if not exists_map.get(substitute_source_id):
-        raise HTTPException(status_code=404, detail=f"Substitute source {substitute_source_id} not found in DAG")
+            raise HTTPException(status_code=404, detail=f"Substitute source {substitute_source_id} not found in DAG")
 
     quarantined_map = await backend.are_quarantined([substitute_source_id])
     if quarantined_map.get(substitute_source_id):
-        raise HTTPException(status_code=403, detail="Substitute source is quarantined")
+            raise HTTPException(status_code=403, detail="Substitute source is quarantined")
 
     declaration = {
-        "target_node_id": target_node_id,
-        "substitute_source_id": substitute_source_id,
-        "declared_at_utc": declared_at_utc,
-        "declared_by": "admin",
+            "target_node_id": target_node_id,
+            "substitute_source_id": substitute_source_id,
+            "declared_at_utc": declared_at_utc,
+            "declared_by": "admin",
     }
     await backend.add_substitute_declaration(declaration)
     return {"status": "success", "message": "Substitute declaration recorded"}
@@ -2063,26 +2087,26 @@ async def ingest_detector_event(source: str, request: Request):
     verify_role_jwt(request, "designator")
 
     if source not in DETECTOR_REGISTRY:
-        raise HTTPException(status_code=400, detail=f"Unknown detector source: {source}. Available: {list(DETECTOR_REGISTRY.keys())}")
+            raise HTTPException(status_code=400, detail=f"Unknown detector source: {source}. Available: {list(DETECTOR_REGISTRY.keys())}")
 
     adapter = DETECTOR_REGISTRY[source]
     raw_event = await request.json()
 
     # Record every inbound event regardless of outcome
     raw_event_record = {
-        "event_id": raw_event.get("event_id", str(uuid.uuid4())),
-        "source": source,
-        "raw_event": raw_event,
-        "received_at_utc": datetime.now(timezone.utc).isoformat() + "Z",
+            "event_id": raw_event.get("event_id", str(uuid.uuid4())),
+            "source": source,
+            "raw_event": raw_event,
+            "received_at_utc": datetime.now(timezone.utc).isoformat() + "Z",
     }
     await backend.record_detector_event(raw_event_record)
 
     designation_fields, drop_reason = await adapter.to_designation(raw_event)
 
     if designation_fields is None:
-        raw_event_record["outcome"] = "dropped"
-        raw_event_record["drop_reason"] = drop_reason
-        return {"designated": False, "reason": drop_reason}
+            raw_event_record["outcome"] = "dropped"
+            raw_event_record["drop_reason"] = drop_reason
+            return {"designated": False, "reason": drop_reason}
 
     # Forward to /designate logic
     designation_event = DesignationEvent(**designation_fields)
@@ -2098,42 +2122,42 @@ async def ingest_detector_event(source: str, request: Request):
 
     per_identity_count = await backend.count_recent_signals(designator_identity, horizon_start)
     if per_identity_count >= settings.DESIGNATION_RATE_LIMIT:
-        await backend.record_signal_attempt(designator_identity, designation_event.poisoned_node_id, "designation", "RATE_LIMITED")
-        raise HTTPException(status_code=429, detail="Rate limit exceeded for designations", headers={"Retry-After": str(settings.CONTINUATION_HORIZON_SECONDS)})
+            await backend.record_signal_attempt(designator_identity, designation_event.poisoned_node_id, "designation", "RATE_LIMITED")
+            raise HTTPException(status_code=429, detail="Rate limit exceeded for designations", headers={"Retry-After": str(settings.CONTINUATION_HORIZON_SECONDS)})
 
     await backend.record_signal_attempt(designator_identity, designation_event.poisoned_node_id, "designation", "PENDING")
 
     async with _admission_exclusive():
-        exists_map, quarantined_map = await asyncio.gather(
-            backend.nodes_exist([designation_event.poisoned_node_id]),
-            backend.are_quarantined([designation_event.poisoned_node_id]),
-        )
-        if not exists_map.get(designation_event.poisoned_node_id):
-            raise HTTPException(status_code=404, detail="Node ID not found in DAG")
-        if quarantined_map.get(designation_event.poisoned_node_id):
-            return {"designated": True, "message": "Node already in quarantine ledger", "already_quarantined": True}
+            exists_map, quarantined_map = await asyncio.gather(
+                backend.nodes_exist([designation_event.poisoned_node_id]),
+                backend.are_quarantined([designation_event.poisoned_node_id]),
+            )
+            if not exists_map.get(designation_event.poisoned_node_id):
+                raise HTTPException(status_code=404, detail="Node ID not found in DAG")
+            if quarantined_map.get(designation_event.poisoned_node_id):
+                return {"designated": True, "message": "Node already in quarantine ledger", "already_quarantined": True}
 
-        c_p = await backend.compute_blast_radius(designation_event.poisoned_node_id)
+            c_p = await backend.compute_blast_radius(designation_event.poisoned_node_id)
 
-        from src.r6_utils import process_recurrence
-        active_horizons = await backend.get_active_horizon_set()
-        for n in c_p:
-            if n in active_horizons:
-                await process_recurrence(backend, n, "RENEWED_DESIGNATION", "internal_hook")
+            from src.r6_utils import process_recurrence
+            active_horizons = await backend.get_active_horizon_set()
+            for n in c_p:
+                if n in active_horizons:
+                    await process_recurrence(backend, n, "RENEWED_DESIGNATION", "internal_hook")
 
-        monotonic_ledger_digest = await backend.compute_quarantine_digest(c_p)
+            monotonic_ledger_digest = await backend.compute_quarantine_digest(c_p)
 
-        q_event = {
-            "quarantine_event_id": str(uuid.uuid4()),
-            "detected_at_utc": datetime.now(timezone.utc).isoformat() + "Z",
-            "poisoned_root_id": designation_event.poisoned_node_id,
-            "computed_blast_radius_C_p": c_p,
-            "monotonic_ledger_digest_post_transition": monotonic_ledger_digest,
-            "designator_identity": designator_identity,
-            "designation_reason": designation_event.reason,
-            "detector_source": source,
-        }
-        await backend.apply_quarantine_transaction(q_event, c_p)
+            q_event = {
+                "quarantine_event_id": str(uuid.uuid4()),
+                "detected_at_utc": datetime.now(timezone.utc).isoformat() + "Z",
+                "poisoned_root_id": designation_event.poisoned_node_id,
+                "computed_blast_radius_C_p": c_p,
+                "monotonic_ledger_digest_post_transition": monotonic_ledger_digest,
+                "designator_identity": designator_identity,
+                "designation_reason": designation_event.reason,
+                "detector_source": source,
+            }
+            await backend.apply_quarantine_transaction(q_event, c_p)
 
     continuity_results = await _attempt_safe_continuity(c_p, q_event)
 
@@ -2143,9 +2167,9 @@ async def ingest_detector_event(source: str, request: Request):
     raw_event_record["quarantine_event_id"] = q_event["quarantine_event_id"]
 
     return {
-        "designated": True,
-        "event": q_event,
-        "continuity": continuity_results,
+            "designated": True,
+            "event": q_event,
+            "continuity": continuity_results,
     }
 
 
@@ -2155,7 +2179,7 @@ async def observe_recurrence(event: ObserveEvent, request: Request):
     signal_source = claims.get("sub", "unknown")
 
     if event.recurrence_class not in ["FUNCTIONAL_FAILURE", "VERIFIER_CONTRADICTION"]:
-        raise HTTPException(status_code=400, detail="Invalid recurrence class")
+            raise HTTPException(status_code=400, detail="Invalid recurrence class")
 
     # --- Rate limiting (§C.1): count the attempt, not the outcome ---
     from datetime import timedelta
@@ -2163,41 +2187,41 @@ async def observe_recurrence(event: ObserveEvent, request: Request):
 
     per_identity_count = await backend.count_recent_signals(signal_source, horizon_start)
     if per_identity_count >= settings.RECURRENCE_SIGNAL_RATE_LIMIT:
-        await backend.record_signal_attempt(signal_source, event.node_id, "recurrence", "RATE_LIMITED")
-        retry_after = settings.CONTINUATION_HORIZON_SECONDS
-        raise HTTPException(
-            status_code=429,
-            detail="Rate limit exceeded for recurrence signals",
-            headers={"Retry-After": str(retry_after)}
-        )
+            await backend.record_signal_attempt(signal_source, event.node_id, "recurrence", "RATE_LIMITED")
+            retry_after = settings.CONTINUATION_HORIZON_SECONDS
+            raise HTTPException(
+                status_code=429,
+                detail="Rate limit exceeded for recurrence signals",
+                headers={"Retry-After": str(retry_after)}
+            )
 
     global_count = await backend.count_recent_signals_global(horizon_start)
     if global_count >= settings.RECURRENCE_SIGNAL_GLOBAL_LIMIT:
-        await backend.record_signal_attempt(signal_source, event.node_id, "recurrence", "RATE_LIMITED")
-        retry_after = settings.CONTINUATION_HORIZON_SECONDS
-        raise HTTPException(
-            status_code=429,
-            detail="Global rate limit exceeded for recurrence signals",
-            headers={"Retry-After": str(retry_after)}
-        )
+            await backend.record_signal_attempt(signal_source, event.node_id, "recurrence", "RATE_LIMITED")
+            retry_after = settings.CONTINUATION_HORIZON_SECONDS
+            raise HTTPException(
+                status_code=429,
+                detail="Global rate limit exceeded for recurrence signals",
+                headers={"Retry-After": str(retry_after)}
+            )
 
     # Record the attempt BEFORE processing — rejected/escalated signals count
     await backend.record_signal_attempt(signal_source, event.node_id, "recurrence", "PENDING")
 
     if event.recurrence_class == "VERIFIER_CONTRADICTION":
-        if not event.adapter_signature:
-            raise HTTPException(status_code=403, detail="adapter_signature required for VERIFIER_CONTRADICTION")
+            if not event.adapter_signature:
+                raise HTTPException(status_code=403, detail="adapter_signature required for VERIFIER_CONTRADICTION")
 
-        adapter_key = settings.RECOVERY_ADAPTER_PUBLIC_KEY
-        if not adapter_key:
-            raise HTTPException(status_code=500, detail="RECOVERY_ADAPTER_PUBLIC_KEY not configured")
+            adapter_key = settings.RECOVERY_ADAPTER_PUBLIC_KEY
+            if not adapter_key:
+                raise HTTPException(status_code=500, detail="RECOVERY_ADAPTER_PUBLIC_KEY not configured")
 
-        try:
-            public_key = _load_public_key(adapter_key)
-            der_sig = _raw_signature_to_der(event.adapter_signature)
-            public_key.verify(der_sig, event.node_id.encode(), ec.ECDSA(hashes.SHA256()))
-        except Exception:
-            raise HTTPException(status_code=403, detail="Invalid adapter signature")
+            try:
+                public_key = _load_public_key(adapter_key)
+                der_sig = _raw_signature_to_der(event.adapter_signature)
+                public_key.verify(der_sig, event.node_id.encode(), ec.ECDSA(hashes.SHA256()))
+            except Exception:
+                raise HTTPException(status_code=403, detail="Invalid adapter signature")
 
     from src.r6_utils import process_recurrence
     await process_recurrence(backend, event.node_id, event.recurrence_class, signal_source, event.evidence)
@@ -2209,7 +2233,7 @@ async def renew_trust(req: RenewTrustRequest, request: Request):
     
     q_ledger = await backend.get_quarantine_ledger()
     if req.node_id in q_ledger:
-        raise HTTPException(status_code=403, detail="Cannot renew trust: Prohibited path from historical quarantine exists (node is tainted)")
+            raise HTTPException(status_code=403, detail="Cannot renew trust: Prohibited path from historical quarantine exists (node is tainted)")
 
     # REQ-008: Re-run R5 graph-safety predicate before renewal
     # Check that no parent of this node has been quarantined since admission
@@ -2217,13 +2241,13 @@ async def renew_trust(req: RenewTrustRequest, request: Request):
     node_data = dag.get(req.node_id, {})
     parent_ids = [p["parent_node_id"] for p in node_data.get("parent_dependency_commitments", [])]
     if parent_ids:
-        quarantined_map = await backend.are_quarantined(parent_ids)
-        tainted_parents = [pid for pid, is_q in quarantined_map.items() if is_q]
-        if tainted_parents:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Cannot renew trust: parent(s) {tainted_parents} are now quarantined (R5 predicate failed)"
-            )
+            quarantined_map = await backend.are_quarantined(parent_ids)
+            tainted_parents = [pid for pid, is_q in quarantined_map.items() if is_q]
+            if tainted_parents:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Cannot renew trust: parent(s) {tainted_parents} are now quarantined (R5 predicate failed)"
+                )
 
     await backend.renew_trust(req.node_id, settings.CONTINUATION_HORIZON_SECONDS)
     return {"status": "success"}
@@ -2233,8 +2257,8 @@ async def renew_trust(req: RenewTrustRequest, request: Request):
 async def calibrate_harness(req: CalibrateRequest, request: Request):
     verify_role_jwt(request, "admin")
     if not settings.DEBUG_MODE:
-        raise HTTPException(status_code=403, detail="Calibration requires DEBUG_MODE")
-        
+            raise HTTPException(status_code=403, detail="Calibration requires DEBUG_MODE")
+            
     await backend.record_calibration_run(req.model_dump())
     return {"status": "success"}
 
@@ -2242,10 +2266,10 @@ async def calibrate_harness(req: CalibrateRequest, request: Request):
 async def get_recurrence_report(request: Request):
     verify_role_jwt(request, "admin")
     return {
-        "active_horizons": await backend.get_active_horizon_set(),
-        "expired_horizons": await backend.get_expired_horizon_set(),
-        "withdrawal_ledger": await backend.get_withdrawal_ledger(),
-        "signal_outcome_counts": await backend.get_signal_outcome_counts()
+            "active_horizons": await backend.get_active_horizon_set(),
+            "expired_horizons": await backend.get_expired_horizon_set(),
+            "withdrawal_ledger": await backend.get_withdrawal_ledger(),
+            "signal_outcome_counts": await backend.get_signal_outcome_counts()
     }
 
 @app.get("/shadow-report")
@@ -2266,8 +2290,7 @@ async def get_shadow_report(request: Request):
     else:
         total = len(backend.shadow_decisions)
         blocked = sum(1 for d in backend.shadow_decisions if d["would_have_blocked"])
-
-        
+            
     return {
         "enforcement_mode": settings.ENFORCEMENT_MODE,
         "total_decisions": total,
@@ -2279,20 +2302,20 @@ async def get_shadow_report(request: Request):
 async def get_db_state(request: Request):
     verify_role_jwt(request, "admin")
     if not settings.DEBUG_MODE:
-        raise HTTPException(status_code=403, detail="Debug endpoints disabled in production")
+            raise HTTPException(status_code=403, detail="Debug endpoints disabled in production")
     return {
-        "dag": await backend.get_dag(),
-        "quarantine_ledger": await backend.get_quarantine_ledger(),
-        "quarantine_events": await backend.get_quarantine_events(),
-        "repair_candidates": await backend.get_repair_candidates(),
-        "enforcement_mode": settings.ENFORCEMENT_MODE
+            "dag": await backend.get_dag(),
+            "quarantine_ledger": await backend.get_quarantine_ledger(),
+            "quarantine_events": await backend.get_quarantine_events(),
+            "repair_candidates": await backend.get_repair_candidates(),
+            "enforcement_mode": settings.ENFORCEMENT_MODE
     }
 
 @app.post("/reset-db")
 async def reset_db(request: Request):
     verify_role_jwt(request, "admin")
     if not settings.DEBUG_MODE:
-        raise HTTPException(status_code=403, detail="Debug endpoints disabled in production")
+            raise HTTPException(status_code=403, detail="Debug endpoints disabled in production")
     await backend.reset()
     return {"status": "ok"}
 
@@ -2313,18 +2336,18 @@ async def seed_root(request: Request, body: dict = Body(...)):
 
     root_id = body.get("root_id")
     if not root_id:
-        raise HTTPException(status_code=400, detail="root_id required")
+            raise HTTPException(status_code=400, detail="root_id required")
     exists = await backend.nodes_exist([root_id])
     if exists.get(root_id):
-        raise HTTPException(status_code=409, detail=f"Node {root_id} already exists")
+            raise HTTPException(status_code=409, detail=f"Node {root_id} already exists")
 
     # Generate a gateway signing key for this seed operation
     from cryptography.hazmat.primitives.asymmetric import utils as asy_utils
     gateway_private_key = ec.generate_private_key(ec.SECP256R1())
     gateway_pub_numbers = gateway_private_key.public_key().public_numbers()
     gateway_pub_hex = (
-        gateway_pub_numbers.x.to_bytes(32, "big")
-        + gateway_pub_numbers.y.to_bytes(32, "big")
+            gateway_pub_numbers.x.to_bytes(32, "big")
+            + gateway_pub_numbers.y.to_bytes(32, "big")
     ).hex()
 
     state_content = {"type": "seed_root", "seeded_by": admin_identity}
@@ -2337,23 +2360,23 @@ async def seed_root(request: Request, body: dict = Body(...)):
     sig_hex = (r.to_bytes(32, "big") + s.to_bytes(32, "big")).hex()
 
     seed_payload = {
-        "payload_id": root_id,
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "ephemeral_nhi": {
-            "identity_id": gateway_pub_hex,
-            "session_token": "gateway_seed",
-            "expires_at_utc": "9999-12-31T23:59:59Z",
-        },
-        "declared_evidence_boundary": {
-            "boundary_id": f"seed-{root_id}",
-            "fixed_at_utc": datetime.now(timezone.utc).isoformat(),
-            "boundary_digest": "0" * 64,
-        },
-        "state_content": state_content,
-        "parent_dependency_commitments": [],
-        "content_digest_sha256": content_hash,
-        "agent_signature": sig_hex,
-        "signature_algorithm": "ECDSA-P256-SHA256",
+            "payload_id": root_id,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "ephemeral_nhi": {
+                "identity_id": gateway_pub_hex,
+                "session_token": "gateway_seed",
+                "expires_at_utc": "9999-12-31T23:59:59Z",
+            },
+            "declared_evidence_boundary": {
+                "boundary_id": f"seed-{root_id}",
+                "fixed_at_utc": datetime.now(timezone.utc).isoformat(),
+                "boundary_digest": "0" * 64,
+            },
+            "state_content": state_content,
+            "parent_dependency_commitments": [],
+            "content_digest_sha256": content_hash,
+            "agent_signature": sig_hex,
+            "signature_algorithm": "ECDSA-P256-SHA256",
     }
     await backend.commit_node(seed_payload)
     return {"status": "ok", "root_id": root_id, "gateway_identity": gateway_pub_hex}
@@ -2370,31 +2393,31 @@ async def get_reducibility_report(request: Request):
     reasons = {}
     
     for rc in repair_candidates.values():
-        disp = rc.get("disposition")
-        if disp == "REDUCIBLE":
-            reducible_count += 1
-        elif disp == "IRREDUCIBLE":
-            irreducible_count += 1
-            reason = rc.get("reason", "unknown")
-            reasons[reason] = reasons.get(reason, 0) + 1
-        else:
-            undecided_count += 1
-            
+            disp = rc.get("disposition")
+            if disp == "REDUCIBLE":
+                reducible_count += 1
+            elif disp == "IRREDUCIBLE":
+                irreducible_count += 1
+                reason = rc.get("reason", "unknown")
+                reasons[reason] = reasons.get(reason, 0) + 1
+            else:
+                undecided_count += 1
+                
     return {
-        "compactions_entering_repair_path": total,
-        "reducible": {
-            "count": reducible_count,
-            "fraction": reducible_count / total if total > 0 else 0.0
-        },
-        "irreducible": {
-            "count": irreducible_count,
-            "fraction": irreducible_count / total if total > 0 else 0.0,
-            "reasons": reasons
-        },
-        "undecided": {
-            "count": undecided_count,
-            "fraction": undecided_count / total if total > 0 else 0.0
-        }
+            "compactions_entering_repair_path": total,
+            "reducible": {
+                "count": reducible_count,
+                "fraction": reducible_count / total if total > 0 else 0.0
+            },
+            "irreducible": {
+                "count": irreducible_count,
+                "fraction": irreducible_count / total if total > 0 else 0.0,
+                "reasons": reasons
+            },
+            "undecided": {
+                "count": undecided_count,
+                "fraction": undecided_count / total if total > 0 else 0.0
+            }
     }
 
 @app.get("/verification-separation-inventory")
@@ -2405,42 +2428,42 @@ async def get_verification_separation_inventory(request: Request):
     """
     verify_role_jwt(request, "admin")
     return {
-        "shared_dependency_inventory": {
-            "specification": "GASC-ED v1.1",
-            "policy_engine": "Open Policy Agent (Rego)",
-            "policy_files": [
-                "policies/gasc_verification_separation.rego",
-                "policies/gasc_quarantine_integrity.rego",
-            ],
-            "cryptographic_library": "cryptography (Python)",
-            "jwt_library": "PyJWT",
-            "shared_primitives": ["SHA-256", "ECDSA-P256", "ES256 JWT"],
-            "recovery_adapter": {
-                "framework": "litellm",
-                "model": os.environ.get("LITELLM_MODEL", "gemini/gemini-1.5-flash"),
+            "shared_dependency_inventory": {
+                "specification": "GASC-ED v1.1",
+                "policy_engine": "Open Policy Agent (Rego)",
+                "policy_files": [
+                    "policies/gasc_verification_separation.rego",
+                    "policies/gasc_quarantine_integrity.rego",
+                ],
+                "cryptographic_library": "cryptography (Python)",
+                "jwt_library": "PyJWT",
+                "shared_primitives": ["SHA-256", "ECDSA-P256", "ES256 JWT"],
+                "recovery_adapter": {
+                    "framework": "litellm",
+                    "model": os.environ.get("LITELLM_MODEL", "gemini/gemini-1.5-flash"),
+                },
+                "schema_validator": "jsonschema (Draft202012Validator)",
             },
-            "schema_validator": "jsonschema (Draft202012Validator)",
-        },
-        "verification_dimensions": {
-            "execution_authority": "Verifier (Rego) runs in OPA subprocess/WASM; planner cannot invoke or suppress",
-            "input_separation": "Candidate and commitments cross boundary; evaluative planner outputs (planner_score, justification, confidence_rating, reasoning_tokens) are blocked by policy",
-            "frontier_reconstruction": "Verifier re-derives frontier independently from graph snapshot",
-            "distinct_implementation": "Rego policy engine vs Python recovery adapter",
-        },
-        "fault_injection_results": {
-            "campaign_run": True,
-            "fault_classes": [
-                {"class": "evaluative_planner_output_injection", "injected": 4, "caught": 4, "escaped": 0},
-                {"class": "quarantined_ancestor_in_frontier", "injected": 1, "caught": 1, "escaped": 0},
-                {"class": "identity_reuse", "injected": 1, "caught": 1, "escaped": 0},
-            ],
-            "total_injected": 6,
-            "total_caught": 6,
-            "total_escaped": 0,
-            "catch_rate": 1.0,
-            "preregistered_minimum_catch_rate": 0.95,
-            "escape_set": [],
-        },
+            "verification_dimensions": {
+                "execution_authority": "Verifier (Rego) runs in OPA subprocess/WASM; planner cannot invoke or suppress",
+                "input_separation": "Candidate and commitments cross boundary; evaluative planner outputs (planner_score, justification, confidence_rating, reasoning_tokens) are blocked by policy",
+                "frontier_reconstruction": "Verifier re-derives frontier independently from graph snapshot",
+                "distinct_implementation": "Rego policy engine vs Python recovery adapter",
+            },
+            "fault_injection_results": {
+                "campaign_run": True,
+                "fault_classes": [
+                    {"class": "evaluative_planner_output_injection", "injected": 4, "caught": 4, "escaped": 0},
+                    {"class": "quarantined_ancestor_in_frontier", "injected": 1, "caught": 1, "escaped": 0},
+                    {"class": "identity_reuse", "injected": 1, "caught": 1, "escaped": 0},
+                ],
+                "total_injected": 6,
+                "total_caught": 6,
+                "total_escaped": 0,
+                "catch_rate": 1.0,
+                "preregistered_minimum_catch_rate": 0.95,
+                "escape_set": [],
+            },
     }
 
 
@@ -2473,32 +2496,32 @@ async def get_measured_cost(request: Request):
     q_set = set(quarantine_ledger)
     breaches = []
     for nid, ndata in dag.items():
-        if nid in q_set:
-            continue
-        for p in ndata.get("parent_dependency_commitments", []):
-            if p["parent_node_id"] in q_set:
-                breaches.append(nid)
-                break
-        else:
-            for covered in ndata.get("covers", []):
-                if covered in q_set:
+            if nid in q_set:
+                continue
+            for p in ndata.get("parent_dependency_commitments", []):
+                if p["parent_node_id"] in q_set:
                     breaches.append(nid)
                     break
+            else:
+                for covered in ndata.get("covers", []):
+                    if covered in q_set:
+                        breaches.append(nid)
+                        break
 
     safety_metrics = {
-        "quarantined_nodes": quarantined_count,
-        "containment_fraction": quarantined_count / total_nodes if total_nodes > 0 else 0.0,
-        "withdrawn_nodes": withdrawn_count,
-        "containment_breaches": len(breaches),
-        "escape_set": breaches,
+            "quarantined_nodes": quarantined_count,
+            "containment_fraction": quarantined_count / total_nodes if total_nodes > 0 else 0.0,
+            "withdrawn_nodes": withdrawn_count,
+            "containment_breaches": len(breaches),
+            "escape_set": breaches,
     }
 
     # Availability: fraction of DAG usable (not quarantined, not withdrawn)
     unavailable = quarantined_count + withdrawn_count
     availability_metrics = {
-        "total_nodes": total_nodes,
-        "unavailable_nodes": unavailable,
-        "availability_fraction": (total_nodes - unavailable) / total_nodes if total_nodes > 0 else 1.0,
+            "total_nodes": total_nodes,
+            "unavailable_nodes": unavailable,
+            "availability_fraction": (total_nodes - unavailable) / total_nodes if total_nodes > 0 else 1.0,
     }
 
     # Coverage: catch rate from repair candidates and calibration
@@ -2506,51 +2529,51 @@ async def get_measured_cost(request: Request):
     reducible_count = sum(1 for rc in repair_candidates.values() if rc.get("disposition") == "REDUCIBLE")
     irreducible_count = sum(1 for rc in repair_candidates.values() if rc.get("disposition") == "IRREDUCIBLE")
     coverage_metrics = {
-        "repair_candidates_total": total_repair,
-        "reducible_count": reducible_count,
-        "irreducible_count": irreducible_count,
-        "verified_repair_coverage": reducible_count / total_repair if total_repair > 0 else 0.0,
+            "repair_candidates_total": total_repair,
+            "reducible_count": reducible_count,
+            "irreducible_count": irreducible_count,
+            "verified_repair_coverage": reducible_count / total_repair if total_repair > 0 else 0.0,
     }
 
     # Function-restoration: how many reintegrated nodes are active
     active_count = len(active_horizons)
     expired_count = len(expired_horizons)
     function_restoration_metrics = {
-        "reintegrated_active": active_count,
-        "reintegrated_expired": expired_count,
-        "reintegrated_total": active_count + expired_count,
-        "restoration_fraction": active_count / (active_count + expired_count) if (active_count + expired_count) > 0 else 0.0,
+            "reintegrated_active": active_count,
+            "reintegrated_expired": expired_count,
+            "reintegrated_total": active_count + expired_count,
+            "restoration_fraction": active_count / (active_count + expired_count) if (active_count + expired_count) > 0 else 0.0,
     }
 
     # Burden: operational cost indicators
     burden_metrics = {
-        "irreducible_fraction": irreducible_count / total_repair if total_repair > 0 else 0.0,
-        "quarantine_pressure": quarantined_count / total_nodes if total_nodes > 0 else 0.0,
-        "withdrawal_amplification": withdrawn_count / max(1, signal_counts.get("PROCESSED", 0) + signal_counts.get("RATE_LIMITED", 0)),
+            "irreducible_fraction": irreducible_count / total_repair if total_repair > 0 else 0.0,
+            "quarantine_pressure": quarantined_count / total_nodes if total_nodes > 0 else 0.0,
+            "withdrawal_amplification": withdrawn_count / max(1, signal_counts.get("PROCESSED", 0) + signal_counts.get("RATE_LIMITED", 0)),
     }
 
     # Recurrence: signal processing and withdrawal
     recurrence_metrics = {
-        "signal_outcome_counts": signal_counts,
-        "withdrawn_count": withdrawn_count,
-        "active_horizons_count": active_count,
-        "expired_horizons_count": expired_count,
-        "calibration_runs": len(calibration_runs),
-        "latest_sensitivity_floor": calibration_runs[-1].get("sensitivity_floor") if calibration_runs else None,
+            "signal_outcome_counts": signal_counts,
+            "withdrawn_count": withdrawn_count,
+            "active_horizons_count": active_count,
+            "expired_horizons_count": expired_count,
+            "calibration_runs": len(calibration_runs),
+            "latest_sensitivity_floor": calibration_runs[-1].get("sensitivity_floor") if calibration_runs else None,
     }
 
     return {
-        "measured_at_utc": datetime.now(timezone.utc).isoformat() + "Z",
-        "population": {
-            "total_nodes": total_nodes,
-            "missingness": "None — all nodes in DAG are counted",
-        },
-        "safety": safety_metrics,
-        "availability": availability_metrics,
-        "coverage": coverage_metrics,
-        "function_restoration": function_restoration_metrics,
-        "burden": burden_metrics,
-        "recurrence": recurrence_metrics,
+            "measured_at_utc": datetime.now(timezone.utc).isoformat() + "Z",
+            "population": {
+                "total_nodes": total_nodes,
+                "missingness": "None — all nodes in DAG are counted",
+            },
+            "safety": safety_metrics,
+            "availability": availability_metrics,
+            "coverage": coverage_metrics,
+            "function_restoration": function_restoration_metrics,
+            "burden": burden_metrics,
+            "recurrence": recurrence_metrics,
     }
 
 @app.get("/readyz")
@@ -2560,14 +2583,14 @@ async def readyz():
     # process per call (~15ms p50, 500ms+ p99 at concurrency 50) and is
     # only acceptable during local development.
     if not settings.DEBUG_MODE:
-        if not settings.OPA_POLICY_BUNDLE and not settings.OPA_URL:
-            raise HTTPException(
-                status_code=503,
-                detail="No fast policy path configured. Set OPA_POLICY_BUNDLE (*.wasm preferred) or OPA_URL. "
-                       "Subprocess fallback is not production-ready."
-            )
+            if not settings.OPA_POLICY_BUNDLE and not settings.OPA_URL:
+                raise HTTPException(
+                    status_code=503,
+                    detail="No fast policy path configured. Set OPA_POLICY_BUNDLE (*.wasm preferred) or OPA_URL. "
+                           "Subprocess fallback is not production-ready."
+                )
     if settings.OPA_POLICY_BUNDLE and not os.path.exists(settings.OPA_POLICY_BUNDLE):
-        raise HTTPException(status_code=503, detail="Policy bundle not found")
+            raise HTTPException(status_code=503, detail="Policy bundle not found")
     return {"status": "ok", "enforcement_mode": settings.ENFORCEMENT_MODE}
 
 @app.get("/livez")
