@@ -275,7 +275,8 @@ class TestC3RootDesignationDoS:
         assert resp.status_code == 403
 
     def test_seed_root_restores_availability(self):
-        """After root quarantine, admin seeds a new root -> writes resume."""
+        """After root quarantine, admin seeds a new root -> writes resume.
+        The seed node must have cryptographic binding and attributable author."""
         _reset()
         assert _designate("clean-parent-1").status_code == 200
 
@@ -284,11 +285,20 @@ class TestC3RootDesignationDoS:
                            json={"root_id": "new-root-1"},
                            headers=_auth("admin"))
         assert resp.status_code == 200
+        assert "gateway_identity" in resp.json()
+
+        # Verify the seeded root has proper cryptographic structure
+        dag = client.get("/db-state", headers=_auth("admin")).json()["dag"]
+        root_data = dag["new-root-1"]
+        assert root_data.get("agent_signature"), "Seed root must have agent_signature"
+        assert root_data.get("ephemeral_nhi", {}).get("identity_id"), \
+            "Seed root must have identity_id"
+        assert root_data.get("content_digest_sha256"), "Seed root must have content hash"
+        assert root_data["state_content"]["seeded_by"] == "admin", \
+            "Seed root must record the authorizing admin identity"
 
         # Writes building on the new root must succeed
-        write = _make_payload("c3-restored", {"data": "alive"}, ["new-root-1"])
-        dag = client.get("/db-state", headers=_auth("admin")).json()["dag"]
-        _content_hash_registry["new-root-1"] = dag["new-root-1"].get("content_digest_sha256", "e" * 64)
+        _content_hash_registry["new-root-1"] = root_data.get("content_digest_sha256", "e" * 64)
         write = _make_payload("c3-restored", {"data": "alive"}, ["new-root-1"])
         resp = client.post("/submit-candidate", json=write)
         assert resp.status_code == 200, f"Write on new root should succeed: {resp.json()}"

@@ -2302,26 +2302,61 @@ async def seed_root(request: Request, body: dict = Body(...)):
     existing root(s) are quarantined. This restores write availability
     without clearing quarantine.
 
+    The seed node is gateway-signed (ECDSA-P256) and records the
+    authorizing admin identity, so it participates in the same
+    cryptographic binding as every other DAG node.
+
     Body: {"root_id": "new-root-id"}
     """
-    verify_role_jwt(request, "admin")
+    claims = verify_role_jwt(request, "admin")
+    admin_identity = claims.get("sub", "unknown")
+
     root_id = body.get("root_id")
     if not root_id:
         raise HTTPException(status_code=400, detail="root_id required")
     exists = await backend.nodes_exist([root_id])
     if exists.get(root_id):
         raise HTTPException(status_code=409, detail=f"Node {root_id} already exists")
+
+    # Generate a gateway signing key for this seed operation
+    from cryptography.hazmat.primitives.asymmetric import utils as asy_utils
+    gateway_private_key = ec.generate_private_key(ec.SECP256R1())
+    gateway_pub_numbers = gateway_private_key.public_key().public_numbers()
+    gateway_pub_hex = (
+        gateway_pub_numbers.x.to_bytes(32, "big")
+        + gateway_pub_numbers.y.to_bytes(32, "big")
+    ).hex()
+
+    state_content = {"type": "seed_root", "seeded_by": admin_identity}
+    content_str = json.dumps(state_content, sort_keys=True)
+    content_hash = hashlib.sha256(content_str.encode()).hexdigest()
+
+    # Sign content_hash with gateway key (same scheme as agent signatures)
+    der_sig = gateway_private_key.sign(content_hash.encode(), ec.ECDSA(hashes.SHA256()))
+    r, s = asy_utils.decode_dss_signature(der_sig)
+    sig_hex = (r.to_bytes(32, "big") + s.to_bytes(32, "big")).hex()
+
     seed_payload = {
         "payload_id": root_id,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "state_content": {"type": "seed_root", "seeded_by": "admin"},
+        "ephemeral_nhi": {
+            "identity_id": gateway_pub_hex,
+            "session_token": "gateway_seed",
+            "expires_at_utc": "9999-12-31T23:59:59Z",
+        },
+        "declared_evidence_boundary": {
+            "boundary_id": f"seed-{root_id}",
+            "fixed_at_utc": datetime.now(timezone.utc).isoformat(),
+            "boundary_digest": "0" * 64,
+        },
+        "state_content": state_content,
         "parent_dependency_commitments": [],
-        "content_digest_sha256": hashlib.sha256(
-            json.dumps({"type": "seed_root", "seeded_by": "admin"}, sort_keys=True).encode()
-        ).hexdigest(),
+        "content_digest_sha256": content_hash,
+        "agent_signature": sig_hex,
+        "signature_algorithm": "ECDSA-P256-SHA256",
     }
     await backend.commit_node(seed_payload)
-    return {"status": "ok", "root_id": root_id}
+    return {"status": "ok", "root_id": root_id, "gateway_identity": gateway_pub_hex}
 
 @app.get("/reducibility-report")
 async def get_reducibility_report(request: Request):
